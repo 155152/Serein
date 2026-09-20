@@ -47,7 +47,11 @@ def routes(services,auth):
             raise HTTPException(400,'recall_ablation_requires_simulation_debug_full')
         maximum=max(0,min(5,int(body.get('max_notes',body.get('max_cards',2)))))
         char_limit=max(160,min(2400,int(body.get('max_chars',1200))))
-        deadline=None if simulation else time.monotonic()+9.0
+        deadline_seconds=body.get('deadline_seconds',9.0)
+        if type(deadline_seconds) not in (int,float) or not math.isfinite(deadline_seconds):
+            raise HTTPException(400,'deadline_seconds must be a finite number')
+        deadline_seconds=max(3.0,min(30.0,float(deadline_seconds)))
+        deadline=None if simulation else time.monotonic()+deadline_seconds
         result=services.recall(query,method='semantic',mode='surface',min_cosine=.5,limit=max(1,maximum),
             user_utterance=True,
             delivered_ids=body.get('delivered_ids',[]),exclude_ids=body.get('exclude_ids',[]),

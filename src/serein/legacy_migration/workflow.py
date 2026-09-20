@@ -91,7 +91,9 @@ class Migration:
 
     def import_bodies(self):
         from ..compat.diaries import Diaries
+        from .legacy_evidence import bind_scene_raw_evidence,resolve_raw_evidence
         diaries=Diaries(self.settings.database,initialize=True)
+        raw_evidence=resolve_raw_evidence(self.settings.database,self.plan)
         for position,item in enumerate(self.plan['items']):
             checkpoint('bodies',position,len(self.plan['items']))
             old_id=item['old_id']
@@ -108,24 +110,30 @@ class Migration:
             key=self.ids[old_id]
             with Store(self.settings.database) as store,store.transaction(immediate=True):
                 doc=store.read(key)
+                provenance=item.get('legacy_provenance') or {}
                 if doc:
                     if doc['body_md']!=item['body'] or doc['title']!=item['title']:
                         raise ValueError('已导入的正文发生编辑，未覆盖：'+old_id)
+                    wanted={**doc['metadata']}
+                    if provenance:wanted['legacy_provenance']=provenance
                     if not (doc['metadata'].get('legacy_tagging_completed') or doc['metadata'].get('legacy_cues_rebuilt')) and not doc['metadata'].get('legacy_tagging_pending'):
-                        store.revise(key,expected_revision=doc['revision'],title=doc['title'],body_md=doc['body_md'],
-                            metadata={**doc['metadata'],'legacy_tagging_pending':True})
+                        wanted['legacy_tagging_pending']=True
+                    if wanted!=doc['metadata']:
+                        doc=store.revise(key,expected_revision=doc['revision'],title=doc['title'],body_md=doc['body_md'],metadata=wanted)
                 else:
                     meta={'object_kind':'scene','memory_value_source':'authored_scene','write_contract':'legacy-ombre-scene-v1',
                         'import_format':'ombre-legacy','legacy_id':old_id,'import_source_hash':item['source_hash'],'legacy_tagging_pending':True,
                         'canonical_domain':'general','domain':['general'],'scene_cues':[],
                         'date':item.get('date',''),'created':item.get('legacy_created','')}
+                    if provenance:meta['legacy_provenance']=provenance
                     store.create(key,'scene',item['title'],item['body'],metadata=meta,
                         lifecycle='archived' if item['archived'] else 'active',manual_surface=not item['archived'],
                         created_at=item.get('legacy_created') or None)
                     store.conn.execute('INSERT INTO index_outbox(document_id) VALUES (?)',(key,))
+                evidence_bound=bind_scene_raw_evidence(store,key,item,raw_evidence,self.plan['fingerprint'])
             from ..recall.passage_layouts import prepare_layouts
             prepare_layouts(self.settings, [key])
-            self.mark(old_id,'body','done',{'kind':'scene','id':key})
+            self.mark(old_id,'body','done',{'kind':'scene','id':key,'evidence_bound':evidence_bound})
         from .comments import import_comments
         self.mark('all','comments','done',import_comments(self.settings.database,self.plan))
 
@@ -144,6 +152,8 @@ class Migration:
         if originals['fingerprint']!=self.plan['originals']['fingerprint']:raise ValueError('扫描后旧原文库发生变化，请重新预览')
         raw_result=import_originals(self.settings.database,originals)
         self.mark('all','originals','done',raw_result)
+        from .legacy_evidence import import_source_archive
+        self.mark('all','legacy_evidence','done',import_source_archive(self.settings.database,self.plan))
         from .dates import repair_dates
         self.mark('all','dates','done',repair_dates(self.settings.database,self.plan))
         return result
@@ -244,8 +254,8 @@ class Migration:
                 raise ValueError('关系程序转换失败，进度已保存，可续跑') from None
 
     def report(self):
-        result={stage:dict(Counter(r['status'] for r in self.db.execute('SELECT status FROM jobs WHERE stage=?',(stage,)))) for stage in ('body','history','originals','dates','comments','companion','tag','edge','vectors','cue_bindings')}
-        result['details']={r['stage']:json.loads(r['result']) for r in self.db.execute("SELECT stage,result FROM jobs WHERE stage IN ('history','originals','dates','comments','companion','vectors','cue_bindings')")}
+        result={stage:dict(Counter(r['status'] for r in self.db.execute('SELECT status FROM jobs WHERE stage=?',(stage,)))) for stage in ('body','history','originals','legacy_evidence','dates','comments','companion','tag','edge','vectors','cue_bindings')}
+        result['details']={r['stage']:json.loads(r['result']) for r in self.db.execute("SELECT stage,result FROM jobs WHERE stage IN ('history','originals','legacy_evidence','dates','comments','companion','vectors','cue_bindings')")}
         result['edge_records']=[json.loads(r[0]) for r in self.db.execute("SELECT result FROM jobs WHERE stage='edge'")]
         (self.root/'report.json').write_text(encode(result),'utf-8')
         return result

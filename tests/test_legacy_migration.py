@@ -23,6 +23,18 @@ def legacy(root, group, key, body):
     return file
 
 
+def legacy_raw_db(root, rows):
+    path=root/'state'/'raw_events.sqlite';path.parent.mkdir(parents=True,exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute('''CREATE TABLE raw_events (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL, source_event_id TEXT NOT NULL,
+            event_hash TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL,
+            created_at TEXT NOT NULL, ingested_at TEXT NOT NULL, conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL, client TEXT NOT NULL, metadata_json TEXT NOT NULL)''')
+        conn.executemany('INSERT INTO raw_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',rows)
+    return path
+
+
 @pytest.fixture
 def setup(tmp_path):
     root=tmp_path/'old'
@@ -98,6 +110,96 @@ def test_daily_impressions_are_discarded_but_ordinary_feel_is_a_diary(setup):
     assert is_daily_impression({'id':'reflection_daily_2026-09-15','tags':[]})
     assert is_daily_impression({'id':'other','tags':'daily_impression, old'})
     assert not is_daily_impression({'id':'other','tags':['old'],'name':'日印象讨论'})
+
+
+def test_haven_source_records_are_archived_as_evidence_not_scenes(tmp_path):
+    root=tmp_path/'old'
+    legacy(root,'dynamic','scene-a','真正的长期记忆。')
+    source=legacy(root,'dynamic','source-a','旧 Stone 证据正文。')
+    source.write_text(source.read_text('utf-8').replace(
+        'tags: [old]',
+        'type: source\ntags: [source_record, cyberboss_backfill]\nsource_type: stone_feature\nsource_id: feature-1\ntarget_representation: bucket_source_record'), 'utf-8')
+    (root/'state').mkdir(parents=True,exist_ok=True)
+    (root/'state'/'memory_edges.jsonl').write_text(
+        json.dumps({'source':'source-a','target':'scene-a','relation_type':'evidenced_by'})+'\n','utf-8')
+    plan=scan(root)
+    assert not plan['errors']
+    assert plan['summary']['scenes']==1 and plan['summary']['source_records']==1
+    assert plan['summary']['old_edges']==0 and plan['summary']['source_edges_archived']==1
+    assert {item['old_id'] for item in plan['items']}=={'scene-a'}
+    assert plan['source_records'][0]['old_id']=='source-a'
+
+    settings=Settings(tmp_path/'new'/'memory.db',tmp_path/'new'/'index.db',writable=True);initialize(settings)
+    migration=Migration(settings,plan,{'user_name':'Mira','ai_name':'Sol','aliases':[]})
+    try:
+        migration.import_history();migration.import_history();migration.import_bodies()
+        with Store(settings.database) as store:
+            assert store.conn.execute("SELECT count(*) FROM documents WHERE kind='scene'").fetchone()[0]==1
+            assert store.conn.execute("SELECT count(*) FROM sources WHERE json_extract(metadata_json,'$.source_system')='ombre_legacy_source_record'").fetchone()[0]==1
+            assert store.conn.execute("SELECT count(*) FROM evidence_bindings").fetchone()[0]==0
+            detached=store.conn.execute("SELECT reason,metadata_json FROM detached_import_records WHERE record_type='ombre_source_edge'").fetchone()
+            assert detached and detached['reason']=='legacy_source_record_endpoint'
+            assert json.loads(detached['metadata_json'])['source']=='source-a'
+    finally:migration.close()
+
+
+def test_haven_raw_provenance_becomes_native_evidence_bindings(tmp_path):
+    root=tmp_path/'old'
+    direct=legacy(root,'dynamic','direct','直接 frontmatter provenance。')
+    direct.write_text(direct.read_text('utf-8').replace(
+        'created: 2026-01-01',
+        'created: 2026-01-01\nsource_raw_event_ids: [7]\nsource_summary_ids: [summary-7]\nfrom_historical_backfill: true'), 'utf-8')
+    recovered=legacy(root,'dynamic','recovered','### moment\n早期恢复记忆。\n### original\nraw_event_ids: 8\nMira：原话。')
+    recovered.write_text(recovered.read_text('utf-8').replace('tags: [old]','tags: [historical_recovery, raw_event_refs]'),'utf-8')
+    legacy_raw_db(root,[
+        (7,'assistant_bridge','evt-7','hash-7','user','第一条原话','2026-01-01T01:00:00Z','2026-01-01T01:00:01Z','conv','main','test','{}'),
+        (8,'assistant_bridge','','hash-8','assistant','第二条原话','2026-01-01T01:01:00Z','2026-01-01T01:01:01Z','conv','main','test','{}'),
+    ])
+    plan=scan(root)
+    assert not plan['errors']
+    by_id={item['old_id']:item for item in plan['items']}
+    assert by_id['direct']['source_raw_event_ids']==[7]
+    assert by_id['direct']['legacy_provenance']['source_summary_ids']==['summary-7']
+    assert by_id['direct']['legacy_provenance']['source_raw_event_ids_origin']=='frontmatter'
+    assert by_id['recovered']['source_raw_event_ids']==[8]
+    assert by_id['recovered']['legacy_provenance']['source_raw_event_ids_origin']=='body_raw_event_ids'
+    assert plan['summary']['scenes_with_raw_evidence']==2
+    assert plan['summary']['raw_evidence_refs']==plan['summary']['unique_raw_evidence_refs']==2
+    assert plan['summary']['body_raw_ref_scenes']==1
+
+    settings=Settings(tmp_path/'new'/'memory.db',tmp_path/'new'/'index.db',writable=True);initialize(settings)
+    migration=Migration(settings,plan,{'user_name':'Mira','ai_name':'Sol','aliases':[]})
+    try:
+        migration.import_history();migration.import_bodies();migration.import_bodies()
+        with Store(settings.database) as store:
+            assert store.conn.execute('SELECT count(*) FROM raw_events').fetchone()[0]==2
+            assert store.conn.execute('SELECT count(*) FROM evidence_bindings WHERE active=1').fetchone()[0]==2
+            refs=[json.loads(row[0]) for row in store.conn.execute('SELECT metadata_json FROM evidence_bindings ORDER BY id')]
+            assert {ref['legacy_raw_event_id'] for ref in refs}=={7,8}
+            assert {ref['binding_method'] for ref in refs}=={'legacy_ombre_raw_event_id'}
+            assert all(ref['content_sha256'] for ref in refs)
+            direct_doc=store.read(migration.ids['direct'])
+            assert direct_doc['metadata']['legacy_provenance']['source_raw_event_ids']==[7]
+            second=store.conn.execute("SELECT source_key FROM sources WHERE json_extract(metadata_json,'$.legacy_raw_event_id')=8").fetchone()[0]
+            # Old integer 8 is not reused as a Serein raw row ID; the standard source identity uses the imported row.
+            assert json.loads(second)[:2]==['assistant_bridge','main']
+            assert json.loads(second)[2]!='8'
+    finally:migration.close()
+
+
+def test_haven_raw_provenance_missing_old_event_fails_closed(tmp_path):
+    root=tmp_path/'old'
+    item=legacy(root,'dynamic','broken','不能猜证据。')
+    item.write_text(item.read_text('utf-8').replace('created: 2026-01-01','created: 2026-01-01\nsource_raw_event_ids: [99]'),'utf-8')
+    legacy_raw_db(root,[])
+    plan=scan(root)
+    settings=Settings(tmp_path/'new'/'memory.db',tmp_path/'new'/'index.db',writable=True);initialize(settings)
+    migration=Migration(settings,plan,{'user_name':'Mira','ai_name':'Sol','aliases':[]})
+    try:
+        migration.import_history()
+        with pytest.raises(ValueError,match='不存在的 raw event'):
+            migration.import_bodies()
+    finally:migration.close()
 
 
 def test_changed_source_is_not_silently_imported_as_another_batch(setup):

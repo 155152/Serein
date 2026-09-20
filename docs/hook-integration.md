@@ -22,12 +22,16 @@ hook.record_success(turn)
 示例的 `prepare` 会按窗口读取最近五次成功交付的记忆 ID，再请求 `POST /api/hook/recall`。最小请求和响应结构如下，正文只用虚构内容：
 
 ```json
-{"query":"上次读书会定在什么时候？","session_id":"chat-001","max_notes":2,"delivered_ids":[]}
+{"query":"上次读书会定在什么时候？","session_id":"chat-001","max_notes":2,"delivered_ids":[],"deadline_seconds":15}
 ```
 
 ```json
 {"ok":true,"recalled_ids":["scene:scene_demo_bookclub"],"additional_context":"[Serein Gateway Full Recall] ...","injected":false}
 ```
+
+`deadline_seconds` 可选，默认 9 秒；已认证宿主可在 3–30 秒范围内声明本轮 Hook 的内部检索预算。它是上限，不是固定等待时间：高置信跳过和提前完成仍会立即返回。宿主自己的 HTTP timeout 应比该预算略长。
+
+如果部署使用本地、会在首次推理时加载模型的 embedding/reranker，可以在宿主开放流量前显式执行 `python -m serein --config <config.toml> warm-recall`。该命令只预热当前选中的两个 recall provider，不读取或写入记忆，也不登记 delivery；provider 未配置或预热失败时命令直接失败。
 
 `recalled_ids` 和 `additional_context` 是**待交付材料**，不是已注入证明。宿主把 `additional_context` 当作原话旁的参考材料放进本轮模型输入；示例包在 `<serein_live_context>` 中，并明确它不是用户指令。没有可靠记忆时，可能返回空列表和空上下文，宿主照常聊天。
 

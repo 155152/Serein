@@ -11,6 +11,12 @@ from .comments import capture_comments, comment_summary
 BUCKETS={'dynamic','permanent','archive','archived','feel','whisper'}
 AFFECT={'reflection','affect_anchor','和弦情绪','情绪和弦','情绪锚点','和弦'}
 DAILY_IMPRESSION_TAGS={'relationship_weather','daily_impression','weekly_impression'}
+LEGACY_PROVENANCE_FIELDS={
+    'source_summary_ids','historical_evidence_dates','historical_candidate_id','historical_backfill_version',
+    'historical_promotion_target','historical_memory_scope','historical_upstream_scope','promotion_notes',
+    'protected_historical_event','from_historical_backfill','daily_chat_memory_candidate_id',
+    'daily_chat_memory_reason','from_daily_chat','source_conversation_turn_ids',
+}
 
 
 def is_old_self_anchor(meta):
@@ -39,6 +45,54 @@ def is_daily_impression(meta):
     elif not isinstance(tags,(list,tuple,set)):
         tags=[]
     return bool({str(tag).strip().lower() for tag in tags} & DAILY_IMPRESSION_TAGS)
+
+
+def _tags(meta):
+    values=meta.get('tags') or []
+    if isinstance(values,str):values=values.split(',')
+    elif not isinstance(values,(list,tuple,set)):values=[]
+    return {str(value).strip().lower() for value in values}
+
+
+def is_source_record(meta):
+    """Recognize Haven-Ombre evidence buckets without treating them as memories."""
+    return (str(meta.get('target_representation') or '').strip().lower()=='bucket_source_record'
+            or 'source_record' in _tags(meta)
+            or (str(meta.get('type') or '').strip().lower()=='source' and bool(meta.get('source_type'))))
+
+
+def _jsonable(value):
+    if value is None or isinstance(value,(str,int,float,bool)):return value
+    if isinstance(value,dict):return {str(key):_jsonable(item) for key,item in value.items()}
+    if isinstance(value,(list,tuple,set)):return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _source_raw_event_ids(meta,body):
+    value=meta.get('source_raw_event_ids')
+    origin='frontmatter'
+    if value is None and 'raw_event_refs' in _tags(meta):
+        match=re.search(r'(?m)^\s*raw_event_ids:\s*([0-9][0-9,\s]*)\s*$',body)
+        if match:
+            value=[part.strip() for part in match[1].split(',') if part.strip()]
+            origin='body_raw_event_ids'
+    if value is None:return [],''
+    if not isinstance(value,(list,tuple,set)):raise ValueError('source_raw_event_ids 必须是数组')
+    result=[]
+    for raw in value:
+        try:key=int(raw)
+        except (TypeError,ValueError):raise ValueError('source_raw_event_ids 必须是正整数') from None
+        if key<=0:raise ValueError('source_raw_event_ids 必须是正整数')
+        if key not in result:result.append(key)
+    return result,origin
+
+
+def _legacy_provenance(meta,raw_ids,raw_id_origin):
+    result={key:_jsonable(meta[key]) for key in LEGACY_PROVENANCE_FIELDS if key in meta}
+    if raw_ids:
+        result['source_raw_event_ids']=list(raw_ids)
+        result['source_raw_event_ids_origin']=raw_id_origin
+    return result
 
 
 def clean_body(text):
@@ -105,7 +159,7 @@ def locate_root(path):
 
 def scan(path):
     root,buckets=locate_root(path)
-    items=[];errors=[];skipped=[];seen=set()
+    items=[];source_records=[];errors=[];skipped=[];seen=set()
     for group in sorted(BUCKETS):
         directory=buckets/group
         if not directory.is_dir():continue
@@ -120,6 +174,8 @@ def scan(path):
                 if not isinstance(meta,dict):raise ValueError('元数据格式错误')
                 old_id=str(meta.get('id') or '').strip()
                 if not old_id:raise ValueError('缺少 id')
+                if old_id in seen:raise ValueError('重复 id，需要先确认保留哪一份')
+                seen.add(old_id)
                 if is_old_self_anchor(meta):
                     skipped.append({'path':relative,'old_id':old_id,'reason':'self_anchor_discarded',
                         'source_hash':hashlib.sha256(raw.encode()).hexdigest()})
@@ -128,8 +184,13 @@ def scan(path):
                     skipped.append({'path':relative,'old_id':old_id,'reason':'daily_impression_discarded',
                         'source_hash':hashlib.sha256(raw.encode()).hexdigest()})
                     continue
-                if old_id in seen:raise ValueError('重复 id，需要先确认保留哪一份')
-                seen.add(old_id)
+                source_body=raw[match.end():].strip()
+                if is_source_record(meta):
+                    if not source_body:raise ValueError('旧 source record 没有正文')
+                    source_records.append({'old_id':old_id,'path':relative,
+                        'title':str(meta.get('name') or meta.get('title') or old_id),'body':source_body,
+                        'source_hash':hashlib.sha256(raw.encode()).hexdigest(),'metadata':_jsonable(meta)})
+                    continue
                 body,removed=clean_body(raw[match.end():])
                 if not body and removed:
                     skipped.append({'path':relative,'old_id':old_id,'reason':'empty_after_section_removal',
@@ -138,17 +199,29 @@ def scan(path):
                 if not body:raise ValueError('原记录没有正文')
                 kind='diary' if group in ('feel','whisper') or meta.get('type') in ('feel','whisper') else 'scene'
                 archived=group in ('archive','archived') or meta.get('type') in ('archive','archived')
-                items.append({'old_id':old_id,'path':relative,'kind':kind,
+                raw_ids,raw_id_origin=_source_raw_event_ids(meta,raw[match.end():]) if kind=='scene' else ([], '')
+                provenance=_legacy_provenance(meta,raw_ids,raw_id_origin)
+                preserved=set(LEGACY_PROVENANCE_FIELDS) if provenance else set()
+                if raw_ids:preserved.add('source_raw_event_ids')
+                item={'old_id':old_id,'path':relative,'kind':kind,
                     'title':str(meta.get('name') or meta.get('title') or old_id),
                     'body':body,'archived':archived,'created':str(meta.get('created') or ''),
                     **legacy_dates(meta),
                     "legacy_comments":capture_comments(meta),
                     'source_hash':hashlib.sha256(raw.encode()).hexdigest(),'removed_affect_sections':removed,
-                    'metadata_fields_discarded':sorted(map(str,meta))})
+                    'metadata_fields_discarded':sorted(set(map(str,meta))-preserved)}
+                if raw_ids:item['source_raw_event_ids']=raw_ids
+                if provenance:item['legacy_provenance']=provenance
+                items.append(item)
             except (ValueError,UnicodeError,yaml.YAMLError) as exc:errors.append({'path':relative,'error':str(exc)})
-    from .edges import scan_edges
-    edges,edge_sources,edge_errors=scan_edges(root)
+    from .edges import endpoints,scan_edges
+    all_edges,edge_sources,edge_errors=scan_edges(root)
     errors.extend(edge_errors)
+    source_ids={item['old_id'] for item in source_records}
+    source_edges=[];edges=[]
+    for edge in all_edges:
+        left,right=(str(value or '') for value in endpoints(edge))
+        (source_edges if left in source_ids or right in source_ids else edges).append(edge)
     from .companion import scan_companion
     try:
         companion=scan_companion(root)
@@ -157,8 +230,20 @@ def scan(path):
         companion={'summary':{'error':'旧 Persona／备忘状态扫描失败'}}
     # Keep existing memory IDs and ledgers stable; companion state has its own fingerprint.
     # Extra date fields must not change old IDs or make a completed batch import twice.
-    identity_items=[{k:v for k,v in item.items() if k not in ('date','legacy_created','legacy_comments')} for item in items]
-    fingerprint=hashlib.sha256(json.dumps({'items':identity_items,'edges':edges,'skipped':skipped},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    identity_items=[]
+    for item in items:
+        identity_item={k:v for k,v in item.items() if k not in
+            ('date','legacy_created','legacy_comments','source_raw_event_ids','legacy_provenance')}
+        if item.get('source_raw_event_ids'):identity_item['source_raw_event_ids']=item['source_raw_event_ids']
+        if item.get('legacy_provenance'):identity_item['legacy_provenance']=item['legacy_provenance']
+        identity_items.append(identity_item)
+    identity={'items':identity_items,'edges':edges,'skipped':skipped}
+    # Preserve the historical fingerprint recipe for ordinary Ombre libraries so
+    # an existing migration can resume after upgrading Serein. Haven-Ombre's
+    # extra evidence layer participates only when it is actually present.
+    if source_records:identity['source_records']=source_records
+    if source_edges:identity['source_edges']=source_edges
+    fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
     from .originals import scan_originals
     try:originals=scan_originals(root)
     except (ValueError,OSError,sqlite3.Error) as exc:
@@ -170,8 +255,7 @@ def scan(path):
     except (ValueError, OSError, sqlite3.Error, KeyError, TypeError) as exc:
         errors.append({'path':'history','error':str(exc)})
         history={'summary':{'warnings':['历史数据扫描失败，请修正后重新预览。']}}
-    return {'root':str(root),'buckets':str(buckets),'fingerprint':fingerprint,'items':items,'edges':edges,'errors':errors,'skipped':skipped,'companion':companion,'history':history,'originals':originals,
-        'summary':{'scenes':sum(i['kind']=='scene' for i in items),'diaries':sum(i['kind']=='diary' for i in items),
+    summary={'scenes':sum(i['kind']=='scene' for i in items),'diaries':sum(i['kind']=='diary' for i in items),
         'archived':sum(i['archived'] for i in items),'old_edges':len(edges),'edge_sources':edge_sources,
         'edge_warning':('' if edge_sources else
             '所选目录没有可识别的旧关系边文件。正文可以单独迁入；这不表示旧库一定没有关系。请核对旧服务实际使用的 state 目录及 Docker 挂载，完整备份应包含 state/memory_edges.jsonl 或存有关系表的 SQLite 库。只有代码和 buckets 的备份可能缺少状态数据。'),
@@ -181,4 +265,20 @@ def scan(path):
         'daily_impressions_discarded':sum(i['reason']=='daily_impression_discarded' for i in skipped),
         'whole_vector_file_present':(buckets/'embeddings.db').is_file(),
         'whole_vectors_without_input_proof':'旧 embeddings 表通常没有原文/哈希，无法验证的向量会重新生成',
-        'daily_impressions':'不导入日印象；不扫描 state 内删除备份和迁移预览', 'companion':companion['summary'], 'history':history['summary'],'originals':originals['summary'],'memory_comments':comment_summary(items)}}
+        'daily_impressions':'不导入日印象；不扫描 state 内删除备份和迁移预览', 'companion':companion['summary'], 'history':history['summary'],'originals':originals['summary'],'memory_comments':comment_summary(items)}
+    result={'root':str(root),'buckets':str(buckets),'fingerprint':fingerprint,'items':items,
+        'edges':edges,'errors':errors,'skipped':skipped,'companion':companion,'history':history,'originals':originals,
+        'summary':summary}
+    evidence_items=[item for item in items if item.get('source_raw_event_ids')]
+    if source_records:
+        result['source_records']=source_records;summary['source_records']=len(source_records)
+    if source_edges:
+        result['source_edges']=source_edges;summary['source_edges_archived']=len(source_edges)
+    if source_records or source_edges:
+        summary['old_edges_scanned']=len(all_edges)
+    if evidence_items:
+        evidence_refs=[int(value) for item in evidence_items for value in item['source_raw_event_ids']]
+        summary.update(scenes_with_raw_evidence=len(evidence_items),raw_evidence_refs=len(evidence_refs),
+            unique_raw_evidence_refs=len(set(evidence_refs)),
+            body_raw_ref_scenes=sum((item.get('legacy_provenance') or {}).get('source_raw_event_ids_origin')=='body_raw_event_ids' for item in evidence_items))
+    return result

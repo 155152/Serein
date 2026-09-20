@@ -116,8 +116,10 @@ def main():
     passage_fill=sub.add_parser('fill-passages', help='Generate missing passage vectors; does not enable passage recall')
     passage_fill.add_argument('--batch-size',type=int,default=16)
     sub.add_parser('rebuild-entities', help='Recheck entity vocabulary against current bound original snapshots')
+    warm = sub.add_parser('warm-recall', help='Explicitly warm the configured embedding and reranker providers')
+    warm.add_argument('--timeout-seconds', type=float, default=60)
     args = parser.parse_args()
-    configured_commands = {"import-chat", "prepare-routes", "setup", "read", "materials", "search", "capabilities", "mcp", "mcp-live", "http", "vector-coverage", "fill-vectors", 'prepare-passages','passage-coverage','fill-passages','rebuild-entities'}
+    configured_commands = {"import-chat", "prepare-routes", "setup", "read", "materials", "search", "capabilities", "mcp", "mcp-live", "http", "vector-coverage", "fill-vectors", 'prepare-passages','passage-coverage','fill-passages','rebuild-entities','warm-recall'}
     if args.config and args.command not in configured_commands:
         parser.error("--config is for read/materials/search/capabilities; imports and writes require explicit paths")
     if args.command in configured_commands:
@@ -138,6 +140,10 @@ def main():
         if args.command == 'prepare-routes':
             from .semantic_setup import prepare
             print(json.dumps(prepare(settings,args.profile,args.examples)))
+            return
+        if args.command == 'warm-recall':
+            from .recall.warmup import warm_recall_models
+            print(json.dumps(warm_recall_models(settings, timeout_seconds=args.timeout_seconds), ensure_ascii=False))
             return
         if args.command == 'import-chat':
             if not settings.writable:

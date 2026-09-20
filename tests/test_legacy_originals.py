@@ -69,8 +69,10 @@ def test_date_priority(meta,expected):assert legacy_dates(meta)['date']==expecte
 
 def test_new_dates_and_old_repair_keep_identity_and_body(setup):
     root,settings,_=setup;plan=scan(root)
+    assert 'source_records' not in plan and 'source_edges' not in plan
+    assert all('source_raw_event_ids' not in item and 'legacy_provenance' not in item for item in plan['items'])
     # Verify the exact old fingerprint recipe, excluding only newly added fields.
-    items=[{k:v for k,v in i.items() if k not in ('date','legacy_created','legacy_comments')} for i in plan['items']]
+    items=[{k:v for k,v in i.items() if k not in ('date','legacy_created','legacy_comments','source_raw_event_ids','legacy_provenance')} for i in plan['items']]
     old=hashlib.sha256(json.dumps({'items':items,'edges':plan['edges'],'skipped':plan['skipped']},sort_keys=True,ensure_ascii=False).encode()).hexdigest()
     assert plan['fingerprint']==old
     migration=Migration(settings,plan,{'user_name':'User','ai_name':'AI','aliases':[]})
