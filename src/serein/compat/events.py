@@ -129,6 +129,76 @@ def reference_blockers(conn, key):
     return reasons
 
 
+def _auto_promote_pipeline_event(conn, event_id):
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='pipeline_event_details' AND type='table'"
+    ).fetchone():
+        return None
+    row = conn.execute(
+        "SELECT details_json FROM pipeline_event_details WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    detail = json.loads(row["details_json"])
+    writer = detail.get("writer") if isinstance(detail.get("writer"), dict) else {}
+    if writer.get("scene_worthy") is not True:
+        if "auto_scene" not in detail:
+            detail["auto_scene"] = {"status": "not_selected"}
+            conn.execute(
+                "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
+                (encode(detail), event_id),
+            )
+        return None
+
+    store = Store.__new__(Store)
+    store.conn = conn
+    event = store.read(event_id)
+    if not event or event["kind"] != "event" or event["lifecycle"] != "active":
+        detail["auto_scene"] = {"status": "not_active"}
+        conn.execute(
+            "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
+            (encode(detail), event_id),
+        )
+        return None
+
+    promoted = store.promoted_scene(event_id)
+    if promoted:
+        detail["auto_scene"] = {"status": "already_promoted", "scene_id": promoted["id"]}
+        conn.execute(
+            "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
+            (encode(detail), event_id),
+        )
+        return promoted["id"]
+
+    covering = store.surface_state(event_id).get("covering_scene_ids") or []
+    if covering:
+        detail["auto_scene"] = {"status": "covered_existing", "scene_id": covering[0]}
+        conn.execute(
+            "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
+            (encode(detail), event_id),
+        )
+        return covering[0]
+
+    from ..core.writer import promote_event_in_store
+    result = promote_event_in_store(
+        store,
+        event,
+        event["title"],
+        event["body_md"],
+        cues=writer.get("kept_details") or [],
+        memory_value_source="automatic_event_scene",
+        write_contract="event-to-scene-auto-v1",
+        actor="event_pipeline",
+    )
+    detail["auto_scene"] = {"status": "promoted", "scene_id": result["id"]}
+    conn.execute(
+        "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
+        (encode(detail), event_id),
+    )
+    return result["id"]
+
+
 def project_events(conn):
     conn.execute("INSERT OR IGNORE INTO event_settlement_receipts "
         "SELECT operation_id,request_sha256,result_json,created_at,'germany_event' FROM fact_event_settlement_operations")
@@ -188,6 +258,7 @@ def project_events(conn):
             store.record_deletion(key, row['updated_at'], meta)
         if changed:
             conn.execute('INSERT INTO index_outbox(document_id) VALUES (?)', (key,))
+        _auto_promote_pipeline_event(conn, key)
     conn.execute('DELETE FROM event_projection_pending')
 
 

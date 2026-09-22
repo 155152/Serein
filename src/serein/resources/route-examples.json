@@ -1,5 +1,5 @@
 {
-  "generation": "public-synthetic-v2",
+  "generation": "public-synthetic-v3",
   "provenance": {
     "adaptation": "Independently authored fictional examples; no personal conversations or event drafts. Route roles and thresholds retained; changed examples require re-embedding and do not imply equivalent routing accuracy."
   },
@@ -115,7 +115,17 @@
       "threshold": null,
       "examples": [
         "上回我们给那份图书馆计划定了哪一天？",
-        "之前挑选地图集时，我们最后选的是哪一本？"
+        "之前挑选地图集时，我们最后选的是哪一本？",
+        "你还记得我们第一次聊那本小说时说了什么吗？",
+        "我什么时候跟你说过我不喜欢那种表达？",
+        "我之前有没有提过自己更喜欢哪一种安排？",
+        "你记得我上次为什么改变主意吗？",
+        "那天我们最后约定了什么？",
+        "后来这件事为什么变成现在这样？",
+        "帮我找回当时我们说过的那句话。",
+        "翻一下以前那次讨论，我们最后怎么决定的？",
+        "我记得之前提过这件事，你还能想起来吗？",
+        "上次发生这件事的时候，我当时是怎么说的？"
       ]
     },
     {

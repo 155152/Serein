@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 import pytest
 from test_public_features import settings, ingest, output_for, synthetic_runner, raw_archive
-from serein.core.store import Store
+from serein.core.store import Store, promoted_scene_id
 from serein.deployment import save_settings
 from serein.extensions import pipeline as p
 from serein.extensions import pipeline_latest as latest
@@ -66,6 +66,52 @@ def test_three_stages_and_writer_sees_exact_predecessor_originals(settings):
         detail=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in detail
         assert set(detail['source_activity_roles'])=={'1','2'}
+
+
+def test_scene_worthy_event_is_atomically_promoted_to_scene(settings):
+    ingest(settings)
+
+    async def runner(role, request):
+        output = output_for(role, request)
+        if role == 'event_writer':
+            output['scene_worthy'] = True
+        return output
+
+    result = asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
+    assert result['events'] == 1
+
+    with Store(settings.database, read_only=True) as store:
+        event_id = store.conn.execute(
+            "SELECT id FROM documents WHERE kind='event' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0]
+        scene_id = promoted_scene_id(event_id)
+        event = store.read(event_id)
+        scene = store.read(scene_id)
+        assert scene is not None
+        assert scene['kind'] == 'scene'
+        assert scene['title'] == event['title']
+        assert scene['body_md'] == event['body_md']
+        assert scene['metadata']['memory_value_source'] == 'automatic_event_scene'
+        assert scene['metadata']['write_contract'] == 'event-to-scene-auto-v1'
+        assert scene['metadata']['scene_cues'] == ['Book club plan']
+        assert scene['metadata']['promoted_from_event']['id'] == event_id
+        event_sources = store.conn.execute(
+            "SELECT source_id FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY source_id",
+            (event_id,),
+        ).fetchall()
+        scene_sources = store.conn.execute(
+            "SELECT source_id FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY source_id",
+            (scene_id,),
+        ).fetchall()
+        assert [row[0] for row in scene_sources] == [row[0] for row in event_sources]
+        surface = store.surface_state(event_id)
+        assert 'promoted_to_scene' in surface['reasons']
+        assert 'covered_by_scene' in surface['reasons']
+        detail = json.loads(store.conn.execute(
+            "SELECT details_json FROM pipeline_event_details WHERE event_id=?",
+            (event_id,),
+        ).fetchone()[0])
+        assert detail['auto_scene'] == {'status': 'promoted', 'scene_id': scene_id}
 
 
 def test_settled_event_is_queued_only_when_arc_linker_is_selected(settings):

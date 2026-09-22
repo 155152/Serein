@@ -47,6 +47,22 @@ def test_provider_failure_and_dimension_mismatch_are_not_silent_fallbacks(client
             assert "test-secret" not in str(error.value)
 
 
+def test_local_provider_may_canonicalize_unqualified_model_to_namespace(client):
+    client.endpoint = "http://127.0.0.1:1234/v1/embeddings"
+    client.local_http = True
+    response = httpx.Response(200, json={
+        "model": "smarttasks/test-model",
+        "data": [{"embedding": [3, 4]}],
+    })
+    with httpx.Client(transport=httpx.MockTransport(lambda request: response)) as http:
+        assert client.query("归航", client=http)["embedding"] == [0.6, 0.8]
+
+    client.local_http = False
+    with httpx.Client(transport=httpx.MockTransport(lambda request: response)) as http:
+        with pytest.raises(ValueError, match="different model"):
+            client.query("归航", client=http)
+
+
 def test_document_batch_maps_positions_and_rejects_duplicate_indexes(client):
     def handle(request):
         assert json.loads(request.content)["input"] == ["第一篇", "第二篇"]

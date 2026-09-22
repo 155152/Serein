@@ -21,6 +21,7 @@ class EmbeddingClient:
             raise ValueError("Embedding endpoint must use HTTPS and match the cached provider host")
         self.endpoint, self.api_key_env = endpoint, api_key_env
         self.api_key = api_key
+        self.local_http = local_http
 
     def query(self, text, *, client=None):
         prepared = self.prepare(text, self.profile["query_instruction"])
@@ -53,7 +54,12 @@ class EmbeddingClient:
             if response.status_code != 200:
                 raise ValueError(f"Embedding provider returned HTTP {response.status_code}; response body omitted")
             result = response.json()
-            if result.get("model") != self.profile["model"] or len(result.get("data", [])) != count:
+            requested_model = self.profile["model"]
+            response_model = str(result.get("model") or "")
+            model_matches = response_model == requested_model
+            if self.local_http and "/" not in requested_model:
+                model_matches = model_matches or response_model.endswith("/" + requested_model)
+            if not model_matches or len(result.get("data", [])) != count:
                 raise ValueError("Embedding provider returned a different model or unexpected number of vectors")
             vectors = {}
             for row in result["data"]:

@@ -106,7 +106,7 @@ def output_for(role,request):
     if role=='event_writer':
         from serein.extensions.pipeline_latest import _SELF_REVIEW_KEYS
         return {'title':'Book club','event_draft':'We agreed to '+request['messages'][0]['content'],
-            'recallable':True,'evidence_sufficient':True,'kept_details':['Book club plan'],'discarded_details':[],
+            'recallable':True,'scene_worthy':False,'evidence_sufficient':True,'kept_details':['Book club plan'],'discarded_details':[],
             'self_review':{key:True for key in _SELF_REVIEW_KEYS}}
     raise AssertionError('Unexpected or retired pipeline stage: '+role)
 
