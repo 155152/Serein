@@ -168,6 +168,20 @@ def test_writer_prompt_examples_match_both_evidence_outcomes():
     assert insufficient['kept_details']==insufficient['discarded_details']==[]
 
 
+def test_writer_prompt_requires_grounded_affective_and_embodied_fidelity():
+    prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':'Synthetic owned source'}])
+    assert '证据约束同时意味着保真义务' in prompt
+    assert '不得因为压缩而默认视为修辞、气氛或旁支' in prompt
+    assert '产生明显情绪反应' in prompt and '发生亲密互动' in prompt
+    assert '普通事务或技术处理没有上述情绪、关系或身体内容时保持简洁' in prompt
+    assert '不为了“有温度”强行补入感受' in prompt
+    assert '由任一方或双方明确表达的欲望、边界、回应和转折' in prompt
+    assert '不得因为“更有情感”而补写' in prompt
+    assert '她去拿快递，我牵挂着她出门的每一步' in prompt
+    assert '事实表面正确，但把原文已经明确存在的情绪转折和具体欲望抽象掉了' in prompt
+    assert '不得为了凑成双方反应替我增加身体感受' in prompt
+
+
 @pytest.mark.parametrize('accepted',[False,True])
 def test_old_pending_evidence_job_is_bypassed_and_history_preserved(settings,accepted):
     from fastapi.testclient import TestClient
