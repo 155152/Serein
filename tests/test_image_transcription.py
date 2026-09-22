@@ -1,5 +1,7 @@
 import asyncio
 import json
+import base64
+import pytest
 
 from serein.api.chat import prepare_image_transcription
 from serein.chat_archive import prepare_turn
@@ -196,3 +198,190 @@ def test_pipeline_uses_separate_image_model_and_persists_transcription(settings,
         rows=store.conn.execute("SELECT image_transcription_status,image_transcription_json FROM raw_events "
                                 "WHERE image_transcription_status='complete'").fetchall()
     assert rows and 'Visible title' in rows[0]['image_transcription_json']
+
+
+def pictures(count=3):
+    raw = base64.b64decode(PNG.split(',', 1)[1])
+    return ['data:image/png;base64,' + base64.b64encode(raw + bytes([i])).decode()
+            for i in range(count)]
+
+
+def test_chat_partial_failure_preserves_success_and_only_retries_missing(settings, monkeypatch):
+    configure(settings, feature=True)
+    urls = pictures()
+    turn = prepare_turn('partial', [{'role': 'user', 'content': [
+        {'type': 'image_url', 'image_url': {'url': url}} for url in urls]}])
+    calls = []
+    fail = True
+    async def complete(model, payload):
+        images = [part for part in payload['messages'][0]['content'] if part['type'] == 'image_url']
+        assert len(images) == 1
+        url = images[0]['image_url']['url']
+        calls.append(url)
+        if fail and url == urls[1]:
+            raise RuntimeError('synthetic failure')
+        return {'choices': [{'message': {'content': json.dumps({'image_transcriptions': [
+            {'input_image': 1, 'text': 'page ' + str(urls.index(url)), 'unreadable': False}]})}}]}
+    monkeypatch.setattr('serein.image_transcription.complete', complete)
+    from fastapi import HTTPException
+    from serein.api.chat import transcribe_image_turn
+    from serein.chat_archive import archive_user_turn
+    with pytest.raises(HTTPException):
+        asyncio.run(transcribe_image_turn(settings, turn))
+    message_id = archive_user_turn(settings, turn)['message_ids'][0]
+    record = raw_archive(settings).get_event(message_id)['image_transcription']
+    assert record['status'] == 'failed'
+    assert [item['position'] for item in record['items']] == [1, 3]
+    fail = False
+    text, receipt = asyncio.run(transcribe_image_turn(settings, turn))
+    assert receipt['status'] == 'complete' and calls == [*urls, urls[1]]
+    assert text.index('page 0') < text.index('page 1') < text.index('page 2')
+    assert raw_archive(settings).get_event(message_id)['image_transcription_status'] == 'complete'
+
+
+def test_transcription_has_wall_clock_timeout(settings, monkeypatch):
+    from serein.image_transcription import transcribe_images
+    from serein.extensions.pipeline_images import freeze_images
+    async def stall(*args, **kwargs):
+        await asyncio.Event().wait()
+    monkeypatch.setattr('serein.image_transcription.complete', stall)
+    images = freeze_images([{'source_message_id': 1, 'position': 1, 'evidence_role': 'owned', 'url': PNG}])
+    with pytest.raises(TimeoutError):
+        asyncio.run(transcribe_images({}, images, timeout_seconds=.01))
+
+
+def test_pipeline_partial_success_survives_resume(settings):
+    configure(settings)
+    urls = pictures()
+    raw_archive(settings).ingest([
+        {'source_event_id':'pages','session_id':'pages','role':'user','text':'Read these pages',
+         'created_at':'2025-01-01T00:00:00Z', 'metadata':{'attachments':[
+             {'kind':'image','url':url} for url in urls]}},
+        {'source_event_id':'reply','session_id':'pages','role':'assistant','text':'Reading',
+         'created_at':'2025-01-01T00:01:00Z'}], source='synthetic')
+    seen = []
+    fail = True
+    async def runner(role, request):
+        if request.get('transcription_only'):
+            assert len(request['images']) == 1
+            position = request['images'][0]['position']
+            seen.append(position)
+            if fail and position == 2:
+                raise RuntimeError('synthetic failure')
+            return {'image_transcriptions':[{'input_image':1,'text':f'page {position}','unreadable':False}]}
+        if role in ('event_curator', 'event_writer'):
+            assert request['images'] == []
+            assert [item['position'] for item in request['curator_image_transcriptions']] == [1, 2, 3]
+        return output_for(role, request)
+    with pytest.raises(RuntimeError):
+        asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
+    fail = False
+    assert asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))['events'] == 1
+    assert seen == [1, 2, 3, 2]
+
+
+def test_waiting_for_transcription_agent_is_pending_not_failed(settings):
+    configure(settings)
+    raw_archive(settings).ingest([
+        {'source_event_id':'picture','session_id':'agent','role':'user','text':'Read',
+         'created_at':'2025-01-01T00:00:00Z','metadata':{'attachments':[{'kind':'image','url':PNG}]}},
+        {'source_event_id':'reply','session_id':'agent','role':'assistant','text':'Reading',
+         'created_at':'2025-01-01T00:01:00Z'}], source='synthetic')
+    task = asyncio.run(p.advance(settings.database, include_recent=True))
+    while task['role'] == 'track_router':
+        p.submit(settings.database, task['job_id'], output_for(task['role'], task['request']))
+        task = asyncio.run(p.advance(settings.database, include_recent=True))
+    assert task['status'] == 'awaiting_agent' and task['request']['transcription_only']
+    message_id = task['request']['images'][0]['source_message_id']
+    assert raw_archive(settings).get_event(message_id)['image_transcription_status'] == 'pending'
+
+
+def test_durable_image_queue_recovers_with_bounded_delayed_retry(settings, monkeypatch):
+    import httpx
+    from serein import work_tasks as tasks
+    from serein.chat_archive import archive_user_turn
+    configure(settings)
+    save_settings(settings.database, {'features': {'image_transcription_async': True}})
+    turn = prepare_turn('recovery', [{'role':'user','content':[{'type':'image_url','image_url':{'url':PNG}}]}])
+    message_id = archive_user_turn(settings, turn)['message_ids'][0]
+    queued = tasks.enqueue_image(settings.database, message_id)
+    assert tasks.enqueue_image(settings.database, message_id)['run_id'] == queued['run_id']
+    calls = []
+    async def unavailable(*args):
+        calls.append(True)
+        raise httpx.ReadTimeout('synthetic timeout')
+    monkeypatch.setattr('serein.api.chat.transcribe_archived_images', unavailable)
+    for attempt in range(4):
+        with pytest.raises(httpx.ReadTimeout):
+            asyncio.run(tasks.execute(settings.database, queued['id'],
+                lambda: tasks.work(settings, queued['id'], queued['arguments']), queued_id=queued['run_id']))
+        tasks.recover_image_work(settings.database)
+        queued = tasks.status(settings.database, queued['id'])
+        assert queued['attempts'] == attempt + 1
+        if attempt < 3:
+            assert queued['status'] == 'queued'
+            waiting = asyncio.run(tasks.execute(settings.database, queued['id'], unavailable, queued_id=queued['run_id']))
+            assert waiting['status'] == 'waiting'
+            stamp = queued['next_attempt_at'] + 1
+            monkeypatch.setattr(tasks.time, 'time', lambda: stamp)
+        else:
+            assert queued['status'] == 'failed'
+    assert len(calls) == 4
+
+
+def test_historical_curator_text_is_reused_with_current_scope(settings):
+    from serein.image_transcription import reusable_transcriptions
+    from serein.extensions.pipeline_images import freeze_images
+    from test_public_features import ingest, synthetic_runner
+    ingest(settings)
+    asyncio.run(p.advance(settings.database, include_recent=True, runner=synthetic_runner))
+    with Store(settings.database) as store:
+        message_id = store.conn.execute('SELECT id FROM raw_events ORDER BY id LIMIT 1').fetchone()[0]
+        image = freeze_images([{'source_message_id':message_id,'position':1,'evidence_role':'context_only','url':PNG}])[0]
+        detail = {'curator_image_transcriptions': [{
+            **{key:image[key] for key in ('source_message_id','position','sha256')},
+            'evidence_role':'owned','text':'historical page','unreadable':False}]}
+        store.conn.execute('UPDATE pipeline_event_details SET details_json=?', (json.dumps(detail),))
+    rows = reusable_transcriptions(settings, [], [image])
+    assert rows[0]['text'] == 'historical page' and rows[0]['evidence_role'] == 'context_only'
+    assert reusable_transcriptions(settings, [], [{**image, 'sha256':'changed'}]) == []
+
+
+def test_image_queue_recovers_expired_lease_and_can_finish_after_restart(settings, monkeypatch):
+    from serein import work_tasks as tasks
+    configure(settings)
+    save_settings(settings.database, {'features': {'image_transcription_async': True}})
+    queued = tasks.enqueue_image(settings.database, 1)
+    queued.update(status='running', attempts=1, lease_until=0)
+    with Store(settings.database) as store:
+        store.conn.execute('UPDATE background_state SET value_json=? WHERE name=?',
+                           (json.dumps(queued), 'work:'+queued['id']))
+    tasks.recover_image_work(settings.database)
+    recovered = tasks.status(settings.database, queued['id'])
+    assert recovered['status'] == 'queued' and recovered['run_id'] != queued['run_id']
+    async def success(*args):
+        return '', {'status':'complete','images':1}
+    monkeypatch.setattr('serein.api.chat.transcribe_archived_images', success)
+    asyncio.run(tasks.execute(settings.database, recovered['id'],
+        lambda: tasks.work(settings, recovered['id'], recovered['arguments']), queued_id=recovered['run_id']))
+    assert tasks.status(settings.database, recovered['id'])['status'] == 'completed'
+
+
+def test_image_freezing_runs_outside_async_request_thread(settings, monkeypatch):
+    import threading
+    from serein.extensions import pipeline_images
+    configure(settings, feature=True)
+    main_thread = threading.get_ident()
+    original = pipeline_images.freeze_images
+    threads = []
+    def freeze(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+    async def complete(*args, **kwargs):
+        return {'choices':[{'message':{'content':json.dumps({'image_transcriptions':[
+            {'input_image':1,'text':'synthetic','unreadable':False}]})}}]}
+    monkeypatch.setattr(pipeline_images, 'freeze_images', freeze)
+    monkeypatch.setattr('serein.image_transcription.complete', complete)
+    turn = prepare_turn('thread', [{'role':'user','content':[{'type':'image_url','image_url':{'url':PNG}}]}])
+    asyncio.run(prepare_image_transcription(settings, turn, {'features':{'image_eyes':True}}))
+    assert threads and all(thread != main_thread for thread in threads)

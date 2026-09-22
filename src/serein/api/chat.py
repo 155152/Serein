@@ -22,32 +22,59 @@ from ..chat_archive import prepare_turn, archive_turn, archive_user_turn
 async def transcribe_image_turn(settings, turn):
     if turn is None or not turn['user'].get('attachments'):
         return '', {}
-    model = task_model(settings.database, 'image_transcription')
-    if not model:
-        raise HTTPException(409, 'Select an image transcription model in Settings')
     archived = archive_user_turn(settings, turn)
     if archived.get('rejected') or len(archived.get('message_ids', [])) != 1:
         raise HTTPException(500, 'Could not archive the source image message')
     message_id = archived['message_ids'][0]
+    try:
+        return await transcribe_archived_images(settings, message_id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, 'Image transcription failed; the chat model was not called') from None
+
+
+async def transcribe_archived_images(settings, message_id):
+    model = task_model(settings.database, 'image_transcription')
+    if not model:
+        raise HTTPException(409, 'Select an image transcription model in Settings')
     from ..compat.raw_archive import raw_archive
     from ..extensions.pipeline_images import freeze_images
-    from ..image_transcription import (cached_transcriptions, mark_transcription,
+    from ..image_transcription import (reusable_transcriptions, mark_transcription,
         persist_transcriptions, transcribe_images, transcription_context)
-    images = freeze_images([{'source_message_id': message_id, 'position': index,
-        'evidence_role': 'owned', 'url': item['url']}
-        for index, item in enumerate(turn['user']['attachments'], 1)])
     event = raw_archive(settings).get_event(message_id)
-    cached = cached_transcriptions([event], images) if event else []
-    if len(cached) == len(images):
-        return transcription_context(cached), {'status':'cached','message_id':message_id,'images':len(cached)}
-    mark_transcription(settings, [message_id], 'pending')
+    if event is None:
+        raise ValueError('Source image message is missing')
+    async def run():
+        images = await asyncio.to_thread(freeze_images, [
+            {'source_message_id': message_id, 'position': index,
+             'evidence_role': 'owned', 'url': item['url']}
+            for index, item in enumerate(event['metadata'].get('attachments', []), 1)])
+        cached = reusable_transcriptions(settings, [event], images)
+        if len(cached) == len(images):
+            return transcription_context(cached), {'status':'cached','message_id':message_id,'images':len(cached)}
+        mark_transcription(settings, [message_id], 'pending', images=images)
+        persist_transcriptions(settings, cached)
+        by_position = {item['position']: item for item in cached}
+        errors = []
+        for image in images:
+            if image['position'] in by_position:
+                continue
+            try:
+                rows = await transcribe_images(model, [image])
+                persist_transcriptions(settings, rows)
+                by_position[image['position']] = rows[0]
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+        rows = [by_position[image['position']] for image in images]
+        return transcription_context(rows), {'status':'complete','message_id':message_id,'images':len(rows)}
     try:
-        rows = await transcribe_images(model, images)
-        persist_transcriptions(settings, rows)
+        return await asyncio.wait_for(run(), timeout=180)
     except Exception as error:
         mark_transcription(settings, [message_id], 'failed', error=type(error).__name__)
-        raise HTTPException(502, 'Image transcription failed; the chat model was not called') from None
-    return transcription_context(rows), {'status':'complete','message_id':message_id,'images':len(rows)}
+        raise
 
 
 async def prepare_image_transcription(settings, turn, state):
@@ -58,9 +85,12 @@ async def prepare_image_transcription(settings, turn, state):
     return await transcribe_image_turn(settings, turn)
 
 
-async def transcribe_image_turn_in_background(settings, turn):
+async def run_queued_image_turn(settings, queued):
+    from ..work_tasks import execute, work
     try:
-        await transcribe_image_turn(settings, turn)
+        await execute(settings.database, queued['id'],
+                      lambda: work(settings, queued['id'], queued.get('arguments', {})),
+                      queued_id=queued['run_id'])
     except Exception as error:
         logging.getLogger(__name__).error('Async image transcription failed: %s', type(error).__name__)
 
@@ -148,7 +178,12 @@ def routes(settings, services, auth):
             if image_receipt:
                 observation.payload['image_transcription'] = {**image_receipt, 'mode':'eyes'}
         elif state['features'].get('image_transcription_async') and archive_input and archive_input['user'].get('attachments'):
-            background_tasks.add_task(transcribe_image_turn_in_background, settings, archive_input)
+            from ..work_tasks import enqueue_image
+            archived = archive_user_turn(settings, archive_input)
+            if archived.get('rejected') or len(archived.get('message_ids', [])) != 1:
+                raise HTTPException(500, 'Could not archive the source image message')
+            queued = enqueue_image(settings.database, archived['message_ids'][0])
+            background_tasks.add_task(run_queued_image_turn, settings, queued)
             observation.payload['image_transcription'] = {'status':'scheduled','mode':'async',
                 'images':len(archive_input['user']['attachments'])}
         model = task_model(settings.database, 'chat', requested=str(body.get('model') or ''))

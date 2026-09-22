@@ -25,7 +25,7 @@ Scene、日记和批注工具按自用版的名称、参数和默认值提供。
 | 新建 Scene | `write_scene(content, cues, title='', date='', domain='', evidence_refs=None)`；只必填正文和 cues；可额外传 `favorite` |
 | 修改 Scene | `edit_scene(scene_id, expected_updated_at, title=None, content=None, cues=None)`；先读当前更新时间 |
 | Scene 状态 | `set_scene_status(scene_id, expected_updated_at, status)`；active / archived / deleted，删除为软删除 |
-| 读取日记 | `read_diary(diary_id=None, date='', limit=20)`；按编号、日期读取或列出最近日记 |
+| 读取日记 | `read_diary(diary_id=None, date='', limit=5, query='', offset=0)`；无编号时列目录，支持标题／正文关键词搜索和日期筛选；指定编号才读全文与评论 |
 | 新建日记 | `write_diary(content, date='', title='', author='ai', unlock_at='')`；日期默认当天，未来解锁时间表示暗房日记 |
 | 修订日记 | `revise_diary(diary_id, content, title=None, date=None)`；保留作者及历史 |
 | 日记评论 | `comment_diary(diary_id, content, author='ai')` |
@@ -42,7 +42,7 @@ Scene 和日记的新建调用会独立创建内容；内部随机操作编号�
 
 ## 日记与暗房
 
-日记使用独立存储和工具，不进入普通 Scene／Event 自动召回，也没有收藏状态。网页和 `read_diary` 可以按编号、日期或最近条目读取；`write_diary`、`revise_diary`、`comment_diary`、`delete_diary` 分别新建、修订、评论和软删除。修订保留作者与历史，删除不会改写既有版本。日记可作为叙事卷材料；梦境在最近 48 小时没有新 Event／Scene 时，才回退读取新日记。
+日记使用独立存储和工具，不进入普通 Scene／Event 自动召回，也没有收藏状态。`read_diary()` 默认只列最近 5 篇的编号、日期、标题和最多 150 字符的原文摘要，不带全文和评论。`query` 对标题与正文做字面包含搜索（不是语义搜索，`%`、`_` 不作通配符），标题命中优先，其次按日期和编号倒序；搜索摘要取关键词附近的原文。`date` 按完整日期筛选，可与 `query` 组合。`limit` 为 1–20；有更多结果时返回 `has_more: true` 和 `next_offset`，翻页保持 query/date/limit 不变。只有 `read_diary(diary_id=编号)` 返回完整正文与评论；编号必须为正数，不与 query/offset 混用。封存正文不参与搜索或摘要，删除项不返回。日记结果以普通文字标题开头，不用 `[diary_list]` 外层标签，避免客户端误解析。网页读取接口保持不变。`write_diary`、`revise_diary`、`comment_diary`、`delete_diary` 分别新建、修订、评论和软删除。修订保留作者与历史，删除不会改写既有版本。日记可作为叙事卷材料；梦境在最近 48 小时没有新 Event／Scene 时，才回退读取新日记。
 
 `write_diary` 的 `unlock_at` 填未来时间时创建暗房日记。到期前读取只返回锁定状态，不返回正文；修订、评论和删除同样被拒绝。达到解锁时间后按普通日记读取，原始作者、日期、修订与评论继续保留。锁定由 Serein 的读取与写入接口执行，不改变数据库备份本身的访问权限。
 

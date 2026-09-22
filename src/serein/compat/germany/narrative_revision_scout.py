@@ -213,6 +213,8 @@ def _prompt_material(item: dict[str, Any]) -> dict[str, Any]:
         "source_excerpt": str(item.get("source_excerpt") or "")[:1400],
         "bound_narrative_ids": list(item.get("bound_narrative_ids") or [])[:8],
         "matched_keywords": list(item.get("matched_keywords") or [])[:8],
+        "matched_entities": list(item.get("matched_entities") or [])[:8],
+        "candidate_sources": list(item.get("candidate_sources") or []),
     }
 
 
@@ -236,7 +238,7 @@ def build_new_roll_candidate_prompt(
                     _prompt_material(item)
                     for item in corridor.get("candidates") or []
                     if isinstance(item, dict)
-                ][:24],
+                ][:32],
             }
         )
     existing = []
@@ -268,6 +270,7 @@ def build_new_roll_candidate_prompt(
                 "\"confidence\":\"high|medium\",\"latest_date\":\"YYYY-MM-DD\"}]}。"
                 "没有可信候选时返回 {\"candidates\":[]}。\n\n"
                 "先检查已有 Arc：新材料确实延续其中一条时填写 target_narrative_id；不得仅因人物相同或泛泛情绪相似而续接。"
+                "候选由关键词、已有实体或语义检索找出；这些命中只表示值得阅读，不证明实体身份相同或属于同一叙事。"
                 "无法续接旧 Arc、但至少两份材料形成独立持续叙事时，target_narrative_id 留空并给出16字以内标题。"
                 "先检查待判断候选：若属于同一条持续叙事，指定 existing_proposal_id，只提交本次材料；"
                 "后台会保留旧材料并去重累积。不要因多了材料或改了标题重复新建。"

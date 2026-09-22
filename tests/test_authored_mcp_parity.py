@@ -147,6 +147,9 @@ def test_http_diary_self_use_flow_and_locked_rejections(runtime):
         diary_text = rpc('read_diary', {'diary_id': key})
         assert 'created_at:' in diary_text and 'bound_sources: 0' in diary_text
         assert 'count: 1' in rpc('read_diary', {'date': entry['date']})
+        directory = rpc('read_diary', {'query': 'Synthetic', 'date': entry['date']})
+        assert directory.startswith('Diary directory\n') and f'diary_id: {key}' in directory
+        assert 'body:' not in directory and 'excerpt: Synthetic diary' in directory
         assert rpc('revise_diary', {'diary_id': key, 'content': 'Revised'})['revision'] == 2
         rpc('comment_diary', {'diary_id': key, 'content': 'Comment'})
         assert '[comment 1] author=ai' in rpc('read_diary', {'diary_id': key})

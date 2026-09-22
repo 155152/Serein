@@ -13,6 +13,7 @@ from ..core.personal import Personal
 from ..core.store import Store, now
 from ..deployment import read_settings
 from .read_text import diary_text
+from .diary_read import diary_directory, validate_read
 
 
 def tools_for(services, settings):
@@ -45,9 +46,13 @@ def tools_for(services, settings):
                     return run()
             return run()
 
-    def read_diary(diary_id: int | None = None, date: str = '', limit: int = 20):
-        """Read diaries by ID or date, respecting locked/deleted entries. Omit selectors to list recent entries."""
-        return diary_text(notebook('read', diary_id=diary_id, date=date, limit=limit))
+    def read_diary(diary_id: int | None = None, date: str = '', limit: int = 5,
+                   query: str = '', offset: int = 0) -> str:
+        """Find diaries by literal title/body query and/or exact date. Without diary_id, return a directory (default 5, limit 1..20) with excerpts of at most 150 characters; title matches rank first, then newest date/ID. Keep filters and limit when using next_offset. Omit filters for recent entries. Read one complete body and comments with diary_id; do not combine it with query/offset. Locked/deleted bodies stay hidden."""
+        validate_read(diary_id, query, limit, offset)
+        if diary_id is None:
+            return diary_directory(settings.database, query=query, date=date, limit=limit, offset=offset, include_archived=True)
+        return diary_text(notebook('read', diary_id=diary_id, date=date, limit=1))
 
     tools = {'read_diary': read_diary}
     if not settings.writable:

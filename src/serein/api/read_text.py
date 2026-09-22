@@ -154,7 +154,7 @@ def arc_materials_text(result: dict[str, Any], *, with_evidence: bool) -> str:
 
 def diary_text(result: dict[str, Any]) -> str:
     items = result.get("diaries") or []
-    lines = ["[diary_list]", f"count: {len(items)}"]
+    lines = ["Diary", f"count: {len(items)}"]
     for item in items:
         kind = str(item.get("entry_type") or item.get("kind") or "diary")
         lines.extend(("", f"kind: {kind}", f"status: {item.get('visibility') or 'active'}",
@@ -172,7 +172,6 @@ def diary_text(result: dict[str, Any]) -> str:
             lines.extend(("bound_sources: 1", f"[source 1] source_id={source_id}"))
         else:
             lines.append("bound_sources: 0")
-    lines.append("[/diary_list]")
     return "\n".join(lines)
 
 

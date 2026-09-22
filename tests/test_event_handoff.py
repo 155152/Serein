@@ -152,10 +152,16 @@ def test_explicit_api_requires_all_models_and_agent_never_calls_api(settings,mon
 
 
 def test_writer_bounded_reread_gets_new_context_images_without_owning_them(settings,monkeypatch):
-    ingest(settings);seen=[]
+    ingest(settings);seen=[];context_ids=[]
     def reread(database,component,query):
+        from serein.compat.raw_archive import raw_archive
+        result=raw_archive(settings).ingest([{
+            'source_event_id':'earlier-image','session_id':'earlier','role':'user','text':'An earlier title',
+            'created_at':'2024-12-31T00:00:00Z',
+            'metadata':{'attachments':[{'kind':'image','url':PNG}]}}],source='synthetic-context')
+        context_id=result['items'][0]['id'];context_ids.append(context_id)
         context=copy.deepcopy(component)
-        context['context_messages'].append({**context['messages'][0],'id':99,'content':'An earlier title',
+        context['context_messages'].append({**context['messages'][0],'id':context_id,'content':'An earlier title',
             'metadata':{'attachments':[{'kind':'image','url':PNG}]}})
         return context
     monkeypatch.setattr(p,'extend_context',reread)
@@ -168,7 +174,7 @@ def test_writer_bounded_reread_gets_new_context_images_without_owning_them(setti
                 'before_message_id':request['component']['messages'][0]['id'],'reason':'missing_subject'}}
         if role=='event_writer':
             seen.append('writer')
-            assert 99 not in request['event']['source_message_ids']
+            assert context_ids[0] not in request['event']['source_message_ids']
             assert request['images']==[]
             assert request['curator_image_transcriptions'][0]['evidence_role']=='context_only'
             assert request['curator_image_transcriptions'][0]['text']=='Earlier title'
@@ -178,7 +184,7 @@ def test_writer_bounded_reread_gets_new_context_images_without_owning_them(setti
     assert seen==['transcribed','writer']
     with Store(settings.database,read_only=True) as store:
         metadata=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
-        assert metadata['curator_image_transcriptions'][0]['source_message_id']==99
+        assert metadata['curator_image_transcriptions'][0]['source_message_id']==context_ids[0]
 
 
 def test_completed_task_media_expires_after_seven_days_but_raw_archive_and_text_remain(settings):

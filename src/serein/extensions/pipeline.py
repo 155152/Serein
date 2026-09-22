@@ -772,29 +772,45 @@ async def _advance(database,*,include_recent=False,runner=None,retry_repair=Fals
 
 async def transcribe_component(database,batch,component,index,runner,*,key_prefix='image_transcription'):
     """Use exact cached rows first, then the separately assigned image model."""
-    from ..image_transcription import cached_transcriptions, mark_transcription, persist_transcriptions
-    probe=request_for(database,batch,'event_curator',component=component,transcription_only=True)
+    from ..image_transcription import reusable_transcriptions, mark_transcription, persist_transcriptions, PROMPT
+    probe=await asyncio.to_thread(request_for,database,batch,'event_curator',component=component,transcription_only=True)
     images=probe.get('images',[])
-    cached=cached_transcriptions(component['context_messages'],images)
+    cached=reusable_transcriptions(database,component['context_messages'],images)
     if len(cached)==len(images):
         component['curator_image_transcriptions']=cached
         return bool(images)
     if not images or not snapshot(database,batch['id'])['models'].get('image_transcription'):
         return False
     message_ids=[item['source_message_id'] for item in images]
-    mark_transcription(database,message_ids,'pending')
-    try:
-        output=await job(database,batch,probe,f'{key_prefix}:{index}',runner)
-        bound=bind_transcriptions(output,images)
-        persist_transcriptions(database,bound)
-        component['curator_image_transcriptions']=bound
-        for message in component['context_messages']:
-            rows=[item for item in bound if item['source_message_id']==message['id']]
-            if rows:message['image_transcription']={'status':'complete','items':rows}
-        return True
-    except Exception as error:
-        mark_transcription(database,message_ids,'failed',error=type(error).__name__)
-        raise
+    mark_transcription(database,message_ids,'pending',images=images)
+    persist_transcriptions(database,cached)
+    by_key={(item['source_message_id'],item['position']):item for item in cached}
+    errors=[]
+    for image in images:
+        key=(image['source_message_id'],image['position'])
+        if key in by_key:continue
+        single={**probe,'images':[image], 'prompt':PROMPT+'\n本次只附一张图，input_image 必须为 1。'}
+        try:
+            output=await job(database,batch,single,
+                f"{key_prefix}:{index}:{key[0]}:{key[1]}:{image['sha256']}",runner)
+            bound=bind_transcriptions(output,[image])
+            persist_transcriptions(database,bound)
+            by_key[key]=bound[0]
+        except AwaitAgent:
+            raise  # Waiting for the configured agent is not a transcription failure.
+        except Exception as error:
+            mark_transcription(database,[key[0]],'failed',error=type(error).__name__)
+            errors.append((key[0],error))
+    if errors:
+        for message_id,error in errors:
+            mark_transcription(database,[message_id],'failed',error=type(error).__name__)
+        raise errors[0][1]
+    bound=[by_key[(image['source_message_id'],image['position'])] for image in images]
+    component['curator_image_transcriptions']=bound
+    for message in component['context_messages']:
+        rows=[item for item in bound if item['source_message_id']==message['id']]
+        if rows:message['image_transcription']={'status':'complete','items':rows}
+    return True
 
 
 def event_writer_concurrency(database,batch,runner):
@@ -877,8 +893,12 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                 request=request_for(database,batch,'event_curator',component=component,context_read=True,pretranscribed=pretranscribed)
                 output=await job(database,batch,request,f'event_curator:{index}:context',runner)
                 component=request['component']
-            if not pretranscribed:
+            # job() restores its frozen request on resume; use that contract,
+            # not the cache state computed before loading the saved task.
+            if not request.get('pretranscribed'):
                 component['curator_image_transcriptions']=bind_transcriptions(output,request.get('images',[]))
+                from ..image_transcription import persist_transcriptions
+                persist_transcriptions(database,component['curator_image_transcriptions'])
             plan=latest.normalize_event_curator_output(decision(output),component);event_results=[]
             first_results=await first_event_writer_pass(database,batch,component,plan,index,runner)
             # Any bounded context read remains serial: it can create shared image
@@ -893,6 +913,8 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                             transcription=await job(database,batch,image_task,f'writer_context_images:{index}:{ordinal}',runner)
                             reading=image_task['component']
                             reading['curator_image_transcriptions']=bind_transcriptions(transcription,image_task['images'])
+                            from ..image_transcription import persist_transcriptions
+                            persist_transcriptions(database,reading['curator_image_transcriptions'])
                     request=request_for(database,batch,'event_writer',messages=owned,event=event,component=reading,context_read=True)
                     written=await job(database,batch,request,f'event_writer:{index}:{ordinal}:context',runner)
                 written={key:value for key,value in written.items() if key!='result_or_unfinished'}

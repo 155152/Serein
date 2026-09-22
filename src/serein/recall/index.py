@@ -177,17 +177,20 @@ class Search:
         self.reader.store.close()
 
     def search(self, query, *, kind=None, mode="surface", limit=10, with_evidence=False,
-               query_embedding=None, min_cosine=None, use_passages=False):
+               query_embedding=None, min_cosine=None, use_passages=False, candidate_ids=None):
         """Return current eligible objects, not proof of successful injection.
 
         Surface mode permits only current surfaceable Event/Scene. Explicit lookup
         can read archived objects and Narrative when specifically requested.
         Query embeddings require exact query/profile and a caller-chosen cutoff.
+        Optional candidate_ids restrict the pool before the result limit; all
+        current readability and content-stamp checks still apply.
         """
         if kind not in {None, "scene", "event", "narrative"} or mode not in {"surface", "lookup"}:
             raise ValueError("Unsupported search kind or mode")
         if not 1 <= limit <= 100:
             raise ValueError("limit must be 1..100")
+        candidate_ids = None if candidate_ids is None else set(candidate_ids)
         if kind == "narrative" and mode != "lookup":
             raise ValueError("Narrative search requires explicit lookup mode")
         query_terms = tokens(query)
@@ -234,6 +237,8 @@ class Search:
         canonical.execute("BEGIN")
         try:
             for row in candidates:
+                if candidate_ids is not None and row['id'] not in candidate_ids:
+                    continue
                 if row["kind"] not in ({kind} if kind else {"event", "scene"}):
                     continue
                 result["candidates"] += 1

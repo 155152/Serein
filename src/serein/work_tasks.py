@@ -43,6 +43,39 @@ def enqueue(database,key,arguments=None):
         return value
 
 
+def enqueue_image(database, message_id):
+    """Archive only the source ID, never credentials, in the existing durable queue."""
+    key = f'image:{int(message_id)}'
+    with Store(database) as store, store.transaction(immediate=True):
+        value = _get(store, key)
+        if value['status'] != 'idle':
+            return value
+        value.update(status='queued', stage='queued', run_id=uuid4().hex,
+                     arguments={'message_id': int(message_id)}, attempts=0,
+                     updated_at=time.time(), next_attempt_at=0)
+        _save(store, key, value)
+        return value
+
+
+def recover_image_work(database):
+    with Store(database) as store, store.transaction(immediate=True):
+        rows = store.conn.execute(
+            "SELECT value_json FROM background_state WHERE name LIKE 'work:image:%' "
+            "AND (json_extract(value_json,'$.status') IN ('running','interrupted') "
+            "OR (json_extract(value_json,'$.status')='failed' "
+            "AND json_extract(value_json,'$.retryable')=1 "
+            "AND json_extract(value_json,'$.attempts')<4))").fetchall()
+        for row in rows:
+            value = _recover(json.loads(row[0]))
+            if (value['status'] == 'interrupted'
+                    or (value['status'] == 'failed' and value.get('retryable'))):
+                if value.get('attempts', 0) < 4:
+                    value.update(status='queued', run_id=uuid4().hex, lease_until=0)
+                else:
+                    value.update(status='failed', retryable=False)
+                _save(store, value['id'], value)
+
+
 def pause(database,key):
     with Store(database) as store,store.transaction(immediate=True):
         value=_recover(_get(store,key))
@@ -76,6 +109,8 @@ def failure_reason(error):
 async def execute(database,key,operation,*,queued_id=None):
     with Store(database) as store,store.transaction(immediate=True):
         value=_recover(_get(store,key))
+        if queued_id and value.get('next_attempt_at', 0) > time.time():
+            return {'status': 'waiting', 'task': value}
         if value['status']=='running' or (value['status']=='queued' and value.get('run_id')!=queued_id):
             return {'status':'busy','task':value}
         if queued_id and (value['status']!='queued' or value.get('run_id')!=queued_id):
@@ -114,6 +149,30 @@ async def execute(database,key,operation,*,queued_id=None):
 
 
 async def work(settings,key,arguments):
+    if key.startswith('image:'):
+        from .deployment import read_settings
+        from .api.chat import transcribe_archived_images
+        from .model_runtime import UpstreamError
+        import httpx
+        if not read_settings(settings.database)['features'].get('image_transcription_async'):
+            return {'status': 'paused'}
+        attempts = status(settings.database, key).get('attempts', 0) + 1
+        progress(attempts=attempts, retryable=False)
+        try:
+            _text, receipt = await transcribe_archived_images(settings, arguments['message_id'])
+            return receipt
+        except Exception as error:
+            retryable = isinstance(error, (TimeoutError, httpx.TransportError, json.JSONDecodeError))
+            delay = 60 * 2 ** (attempts - 1)
+            if isinstance(error, UpstreamError):
+                retryable = error.response.status_code == 429 or error.response.status_code >= 500
+                retry_after = error.response.headers.get('Retry-After', '')
+                if retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
+            elif isinstance(error, ValueError) and not retryable:
+                retryable = str(error).startswith(('Image transcription returned', '图片转录', '每张输入图片', '空白转录'))
+            progress(retryable=retryable, next_attempt_at=time.time()+delay)
+            raise
     if key.startswith('legacy:'):
         from .legacy_migration.web import run as migrate
         batch=asyncio.create_task(asyncio.to_thread(migrate,settings,key.removeprefix('legacy:')))
@@ -156,10 +215,13 @@ async def work(settings,key,arguments):
 async def run(settings):
     """Queued work survives page navigation; stale running work is explicitly resumable."""
     while True:
+        recover_image_work(settings.database)
         with Store(settings.database,read_only=True) as store:
             queued=[json.loads(row[0]) for row in store.conn.execute(
                 "SELECT value_json FROM background_state WHERE name LIKE 'work:%' AND json_extract(value_json,'$.status')='queued'")]
         for value in queued:
+            if value.get('next_attempt_at', 0) > time.time():
+                continue
             try:
                 await execute(settings.database,value['id'],lambda:work(settings,value['id'],value.get('arguments',{})),queued_id=value['run_id'])
             except Exception:

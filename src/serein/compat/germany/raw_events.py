@@ -186,9 +186,28 @@ class RawEventStore:
                                    payload: dict[str, Any] | None = None) -> None:
         if status not in {"pending", "complete", "failed"}:
             raise ValueError("Unknown image transcription status")
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True) if payload is not None else None
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            previous = conn.execute('SELECT image_transcription_json FROM raw_events WHERE id=?',
+                                    (int(row_id),)).fetchone()
+            if previous is None:
+                raise ValueError('Unknown raw event')
+            old = json.loads(previous[0] or '{}') or {}
+            merged = {**old, **(payload or {}), 'status': status}
+            # Concurrent chat/pipeline writers merge successes in one transaction.
+            # Failure or pending markers must never erase a completed image.
+            items = {int(item['position']): item for item in old.get('items', [])}
+            items.update({int(item['position']): item for item in (payload or {}).get('items', [])})
+            merged['items'] = [items[key] for key in sorted(items)]
+            if status == 'complete' and merged.get('receipts'):
+                expected = {(item['position'], item['sha256']) for item in merged['receipts']}
+                actual = {(item['position'], item['sha256']) for item in merged['items']}
+                if not expected.issubset(actual):
+                    status = merged['status'] = 'pending'
+            if status == 'complete':
+                merged.pop('error', None)
+            encoded = json.dumps(merged, ensure_ascii=False, sort_keys=True)
             cursor = conn.execute(
                 "UPDATE raw_events SET image_transcription_status=?, image_transcription_json=?, "
                 "image_transcription_updated_at=? WHERE id=?",

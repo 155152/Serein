@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import defaultdict
 
@@ -26,32 +27,48 @@ def _content_text(value):
 
 
 async def transcribe_images(model, images, *, timeout_seconds=180):
+    """One request per image, with a wall-clock deadline for the whole call."""
     if not images:
         return []
     verify_images(images)
+    async def run():
+        rows = []
+        for image in images:
+            rows.extend(await _transcribe_one(model, image, timeout_seconds))
+        return rows
+    return await asyncio.wait_for(run(), timeout=timeout_seconds)
+
+
+async def _transcribe_one(model, image, timeout_seconds):
     content = [{"type": "text", "text": PROMPT}]
-    content.extend({"type": "image_url", "image_url": {"url": item["url"]}} for item in images)
+    content.append({"type": "image_url", "image_url": {"url": image["url"]}})
     response = await complete(
         {**model, "request_timeout_seconds": timeout_seconds},
         {"messages": [{"role": "user", "content": content}],
          "response_format": {"type": "json_object"}},
     )
-    raw = _content_text(response["choices"][0]["message"]["content"]).strip()
+    try:
+        choice = response['choices'][0]
+        if choice.get('finish_reason') in ('length', 'max_tokens'):
+            raise ValueError('Image transcription returned truncated content')
+        raw = _content_text(choice['message']['content']).strip()
+    except (KeyError, IndexError, TypeError):
+        raise ValueError('Image transcription returned invalid content') from None
     output = json.loads(raw)
     if not isinstance(output, dict) or set(output) != {"image_transcriptions"}:
         raise ValueError("Image transcription returned an invalid JSON object")
-    return bind_transcriptions(output, images)
+    return bind_transcriptions(output, [image])
 
 
 def cached_transcriptions(messages, images):
-    """Return only completed transcriptions bound to the current exact bytes."""
+    """Successful individual images survive a pending/failed sibling."""
     actual = {(int(item["source_message_id"]), int(item["position"])): item for item in images}
     result = []
     seen = set()
     for message in messages:
         message_id = int(message["id"])
         record = message.get("image_transcription")
-        if not isinstance(record, dict) or record.get("status") != "complete":
+        if not isinstance(record, dict):
             continue
         for item in record.get("items") or []:
             if not isinstance(item, dict):
@@ -75,7 +92,34 @@ def _archive(target):
     return RawEventStore({"raw_events": {"db_path": str(database)}})
 
 
+def reusable_transcriptions(target, messages, images):
+    """Refresh raw-row caches and reuse host-bound results of earlier Curator runs."""
+    if not images:
+        return []
+    database = target.database if hasattr(target, 'database') else target
+    archive = _archive(target)
+    ids = sorted({image['source_message_id'] for image in images})
+    fresh = [archive.get_event(message_id) for message_id in ids]
+    candidates = [item for item in fresh if item] + list(messages)
+    from .core.store import Store
+    with Store(database, read_only=True) as store:
+        exists = store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_event_details'").fetchone()
+        if ids and exists:
+            rows = store.conn.execute(
+                "SELECT value FROM pipeline_event_details, "
+                "json_each(details_json, '$.curator_image_transcriptions') "
+                "WHERE json_extract(value, '$.source_message_id') IN ("
+                + ','.join('?' for _ in ids) + ')', ids).fetchall()
+            for row in rows:
+                item = json.loads(row[0])
+                candidates.append({'id': item['source_message_id'],
+                                   'image_transcription': {'items': [item]}})
+    return cached_transcriptions(candidates, images)
+
+
 def persist_transcriptions(target, items):
+    if not items:
+        return
     grouped = defaultdict(list)
     for item in items:
         grouped[int(item["source_message_id"])].append(dict(item))
@@ -87,10 +131,14 @@ def persist_transcriptions(target, items):
             {"status": "complete", "updated_at": stamp, "items": rows})
 
 
-def mark_transcription(target, message_ids, status, *, error=""):
+def mark_transcription(target, message_ids, status, *, error="", images=()):
     archive = _archive(target)
     for message_id in dict.fromkeys(int(value) for value in message_ids):
         payload = {"status": status, "updated_at": now()}
+        receipts = [{'position': item['position'], 'sha256': item['sha256']}
+                    for item in images if item['source_message_id'] == message_id]
+        if receipts:
+            payload['receipts'] = receipts
         if error:
             payload["error"] = error[:200]
         archive.update_image_transcription(message_id, status, payload)

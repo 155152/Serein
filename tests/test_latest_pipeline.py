@@ -140,6 +140,19 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
     assert '标题为空' in latest.validate_event_writer_result(output)
 
 
+def test_public_writer_materializes_source_grounded_rules_with_configured_names():
+    with latest.identity_scope({'ai_name': 'Atlas', 'user_name': 'Lin'}):
+        rules = latest.materialize_agent_rules('event_writer')
+    assert 'Atlas 在回复中对Lin的话作出的展开' in rules
+    assert '最小完整语义单位' in rules and '局部回应不能改变前句' in rules
+    assert '不额外补出理解、判断、解释等动作' in rules
+    assert '不把某一种归属句式当成模板' in rules
+    assert '原文停留在“想、打算、建议' in rules
+    assert '反例三' in rules and '台灯' in rules
+    assert '我把这句话理解成' not in rules
+    assert 'Haven' not in rules and '小雨' not in rules
+
+
 def test_model_counting_tolerance_settles_without_truncation(settings):
     ingest(settings)
     curator=curator_task(settings)

@@ -123,6 +123,8 @@ Event 使用同样的文本块结构，`ref` 以 `event:` 开头。没有明确�
 
 日记与 Scene／Event 分开保存，可以在网页按日期阅读，也可以用 `read_diary`、`write_diary`、`revise_diary`、`comment_diary` 和 `delete_diary` 管理。修订、评论和软删除都有记录；日记不参加普通的 Scene／Event 自动召回，也不能收藏，需要时由网页或工具明确读取。
 
+`read_diary()` 默认列最近 5 篇的简短目录。传 `query` 搜索标题和正文，传 `date` 筛选日期，两者可组合；每条摘要最多 150 字符，标题命中优先，再按日期倒序。更多结果用 `next_offset` 翻页（保持 query/date/limit 不变，limit 为 1–20）。选中后用 `read_diary(diary_id=编号)` 读取单篇全文和评论。升级后刷新 MCP 工具列表以获取 query/offset 参数。
+
 写日记时设置未来的 `unlock_at`，它会成为暗房日记。解锁前正文保持锁定，不能读取、修订、评论或删除；到达解锁时间后按普通日记读取。日记和已解锁的暗房内容可以成为叙事卷材料；近期没有 Event／Scene 时，新日记也可以作为梦境材料。
 
 工具参数、锁定边界与写入约定见 [功能与工具约定](docs/public-feature-contracts.md#日记与暗房)。
