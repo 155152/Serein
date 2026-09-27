@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1300" viewBox="0 0 1240 1300" role="img" aria-labelledby="title desc">
   <title id="title">Serein 自动 Event 流水线</title>
-  <desc id="desc">白天在同一会话至少积累五个完整回复包且会话静默至少二十分钟后归线；回复包只粗分等待边界，每条消息仍由 Track Router 逐条归线。消息随后经 Curator 切分与图片转录、宿主校验、Event Writer、结构校验和幂等结算，直接写成 Serein 正式 Event；落库后可选由 Arc Linker 归入已有叙事卷，Event 升为 Scene 是另一个独立可选操作。</desc>
+  <desc id="desc">白天在同一会话至少积累五个完整回复包且会话静默至少二十分钟后归线；回复包只粗分等待边界，每条消息仍由 Track Router 逐条归线。图片先逐张转录，消息随后经 Curator 切分、宿主校验、Event Writer、结构校验和幂等结算，直接写成 Serein 正式 Event；落库后可选由 Arc Linker 归入已有叙事卷，Event 升为 Scene 是另一个独立可选操作。</desc>
   <defs>
     <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#f8f8f4"/>
@@ -97,9 +97,9 @@
   <text x="924" y="559" class="node-copy">Track 不是 Event 边界</text>
 
   <text x="526" y="494" class="chip">MODEL 2</text>
-  <text x="526" y="523" class="node-title">Curator · 切分与图片转录</text>
+  <text x="526" y="523" class="node-title">Curator · 切分整理</text>
   <text x="526" y="548" class="node-copy">create / extend / merge</text>
-  <text x="526" y="571" class="small">或 skip / defer · 读取已有 Scene 对照</text>
+  <text x="526" y="571" class="small">或 skip / defer · 图片先逐张转录</text>
 
   <text x="80" y="494" class="chip">DETERMINISTIC HOST</text>
   <text x="80" y="523" class="node-title">冻结 ownership 与阅读范围</text>
