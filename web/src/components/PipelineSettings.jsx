@@ -45,6 +45,17 @@ export function PipelineSettings({onOpenSummary}) {
     setRebuildTarget(work?.result?.batch_id||work?.batch_id||'');
     rebuildDialog.current.showModal();
   }
+  async function retryImage(sha256) {
+    if(busy||running)return;
+    setBusy(true);
+    try {
+      const result=await call('retry-image',{sha256});
+      if(result.status==='busy')throw new Error('整理任务正在运行，请稍后重试。');
+      accept(await call('status'));
+      accept(await call('next',{include_recent:true}));
+      setStatus('已重新开放这张图片的三次转录机会，正在继续整理。');
+    }catch(error){setStatus(error.message);}finally{setBusy(false);}
+  }
   async function confirmRebuild() {
     if(busy||!rebuildTarget)return;
     setBusy(true);
@@ -86,6 +97,9 @@ export function PipelineSettings({onOpenSummary}) {
       {work.result?.deferred>0&&<p>暂缓 {work.result.deferred} 条原话；其中 {work.result.protected_deferrals?.length||0} 条事件提案涉及已有内容保护。可对照原话与已有事件人工处理。</p>}
       {candidateOverflows.map(item=><p key={item.track_id} className="import-error">Track <code>{item.track_id}</code> 有 {item.eligible_active_leaf_count} 条 active Event leaves，超过上限 {item.limit}；本批未调用 Curator 或 Writer。请先归档误归线或不再需要的 Event，或人工安全合并相关 leaves。</p>)}
       {work.result?.skipped>0&&<p>本批跳过 {work.result.skipped} 条原话，原始记录仍保留。</p>}
+      {(work.failed_images||[]).map(image=><p className="import-error" key={image.sha256}>
+        图片 {image.sha256.slice(0,8)} 转录失败三次，已暂停自动重试；依赖它的原话仍保留。
+        <button type="button" disabled={busy||running} onClick={()=>retryImage(image.sha256)}>重试这张图片</button></p>)}
       {failure&&<p className="import-error">{needsRepair?'待修复原因':'失败原因'}：{failure}</p>}
       {needsRepair&&<p>批次：<code>{work.result?.batch_id||work.batch_id}</code>。原话与已完成步骤保留。先重新校验以恢复历史归线；无法恢复时，可明确作废本批计划并重新归线。不会跳过原话或删除已保存的 Event。</p>}
       {task&&<p>等待 {stages[task.role]||task.role}：下载任务交给 Agent，再提交返回的 JSON。</p>}</div>}
