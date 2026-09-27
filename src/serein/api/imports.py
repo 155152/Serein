@@ -51,9 +51,13 @@ def routes(settings,auth):
     @router.get('/v1/pipeline/status')
     def pipeline_status():
         value=status(settings.database,'pipeline')
+        from ..image_transcription import initialize_failures
+        with Store(settings.database) as store:initialize_failures(store.conn)
         if value.get('stage')=='event_evidence':
             value.update(status='idle',stage='idle',result=None,job_id='',error='旧证据整理阶段已撤掉，继续整理会进入下一阶段。')
         with Store(settings.database,read_only=True) as store:
+            value['failed_images']=[dict(row) for row in store.conn.execute(
+                'SELECT sha256,failures,error FROM pipeline_image_failures WHERE failures>=3 ORDER BY updated_at DESC')]
             quiet=value['status']=='completed' and value.get('stage') in ('settled_today','waiting_settlement_window')
             if (value['status']=='idle' or quiet) and store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_jobs'").fetchone():
                 row=store.conn.execute("SELECT j.* FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE b.status='pending' AND j.output_json IS NULL AND json_extract(j.request_json,'$.role')!='event_evidence' ORDER BY j.rowid LIMIT 1").fetchone()
@@ -70,6 +74,16 @@ def routes(settings,auth):
                 'SELECT id,attempt,created_at,error,length(output_text) output_chars FROM pipeline_attempts WHERE job_id=? ORDER BY id DESC LIMIT 5',
                 (value.get('job_id',''),))] if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_attempts'").fetchone() else []
         return value
+
+    @router.post('/v1/pipeline/retry-image')
+    async def retry_image(body:dict):
+        from ..work_tasks import execute
+        from ..image_transcription import retry_failed_image
+        from ..extensions.pipeline import initialize
+        async def retry():
+            initialize(settings.database)
+            return retry_failed_image(settings.database,body.get('sha256'))
+        return await execute(settings.database,'pipeline',retry)
 
     @router.get('/v1/pipeline/attempts/{attempt_id}')
     def pipeline_attempt(attempt_id:int):
