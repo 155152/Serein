@@ -378,6 +378,41 @@ def test_id_correction_retry_keeps_bad_output_and_accepts_only_valid(settings,mo
         assert '999999' not in store.conn.execute('SELECT output_json FROM pipeline_jobs WHERE id=?',(task['job_id'],)).fetchone()[0]
 
 
+def test_router_fills_only_missing_existing_track_updates():
+    output={
+        'message_assignments':[{
+            'source_message_id':1,
+            'primary_track_ref':'session_test_track_0001',
+            'context_track_refs':['new:1'],
+            'routing_role':'bridge',
+        }],
+        'track_updates':[{
+            'track_ref':'new:1','subject':'new','throughline':'new arc','event_policy':'default','status':'active'
+        }],
+    }
+    tracks=[{
+        'track_id':'session_test_track_0001','subject':'old','throughline':'old arc',
+        'event_policy':'rolling_engineering','status':'parked'
+    }]
+    p.fill_missing_existing_track_updates(output,tracks)
+    by_ref={item['track_ref']:item for item in output['track_updates']}
+    assert set(by_ref)=={'session_test_track_0001','new:1'}
+    assert by_ref['session_test_track_0001']=={
+        'track_ref':'session_test_track_0001','subject':'old','throughline':'old arc',
+        'event_policy':'rolling_engineering','status':'parked'
+    }
+
+
+def test_slow_stage_timeout_is_extended_without_changing_small_router_or_curator():
+    assert p.api_timeout_seconds('track_router', 49999, 600)==600
+    assert p.api_timeout_seconds('track_router', 50000, 600)==1200
+    assert p.api_timeout_seconds('event_curator', 50000, 600)==600
+    assert p.api_timeout_seconds('event_writer', 1000, 600)==1200
+    assert p.api_timeout_seconds('event_writer', 50000, 600)==1200
+    assert p.api_timeout_seconds('event_writer', 50000, 1000)==1800
+    assert p.api_timeout_seconds('event_writer', 50000, 1800)==1800
+
+
 def test_timeout_durable_diagnostic_and_prompt_budget_before_model(settings,monkeypatch):
     ingest(settings)
     save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],

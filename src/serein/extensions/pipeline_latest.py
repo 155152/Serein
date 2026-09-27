@@ -539,7 +539,21 @@ def attachment_references(message: dict[str, Any]) -> list[dict[str, Any]]:
     return references
 
 def writer_transcript_payload(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{'message_id': int(item['id']), 'created_at': item.get('created_at'), 'speaker': '她' if item.get('role') == 'user' else '我', 'text': str(item.get('content') or ''), 'saved_snowflake': False, 'memory_event_source': bool((item.get('metadata') or {}).get('memory_event_source')), 'attachment_refs': attachment_references(item)} for item in messages]
+    result: list[dict[str, Any]] = []
+    for item in messages:
+        row = {
+            'message_id': int(item['id']),
+            'created_at': item.get('created_at'),
+            'speaker': '她' if item.get('role') == 'user' else '我',
+            'text': str(item.get('content') or ''),
+        }
+        if (item.get('metadata') or {}).get('memory_event_source'):
+            row['memory_event_source'] = True
+        attachments = attachment_references(item)
+        if attachments:
+            row['attachment_refs'] = attachments
+        result.append(row)
+    return result
 
 def event_reading_block_payload(messages: list[dict[str, Any]], context_messages: list[dict[str, Any]] | None, source_activity_roles: dict[int, str] | None=None) -> list[dict[str, Any]]:
     owned_ids = {int(item['id']) for item in messages}
@@ -590,7 +604,20 @@ def build_event_writer_prompt(day: str, title: str, messages: list[dict[str, Any
     return f'[memory_phase: sol_event_writer]\n日期：{day}（Asia/Shanghai）\n{title_hint}\n正文最多 1000 字，这是写作硬上限而非目标；不要为了接近上限补内容，短 Event 写清即停。优先保留不可替代的原话锚点、真实转折、关键因果、承诺条件和实际落点，删除逐轮复述、旁支和重复解释。\n\n{agent_rules}\n\n证据充分时，输出以下 JSON，recallable 与 scene_worthy 分别按规则判断 true 或 false：\n{{"evidence_sufficient":true,"recallable":true,"scene_worthy":true,"kept_details":["进入正文的辨识锚点"],"discarded_details":["owned 中彻底删除的旁支"],"self_review":{{"owned_evidence_sufficient":true,"owned_claims_only":true,"context_not_promoted":true,"referents_resolved":true,"identity_correct":true,"facts_and_causality_checked":true,"result_preserved":true}},"title":"短标题","event_draft":"自然连贯的第一人称 Event 正文"}}\n\n证据不足时，正文、标题和细节数组必须清空，输出：\n{{"evidence_sufficient":false,"recallable":false,"scene_worthy":false,"kept_details":[],"discarded_details":[],"self_review":{{"owned_evidence_sufficient":false,"owned_claims_only":true,"context_not_promoted":true,"referents_resolved":true,"identity_correct":true,"facts_and_causality_checked":true,"result_preserved":true}},"title":"","event_draft":""}}\n此时其余 self_review=true 表示没有生成越界或未核实的 Event 内容，不表示缺失的事实已获证实。\n{WRITER_ATTACHMENT_RULE}\n\n<event_reading_block_json>\n{json.dumps(reading_block, ensure_ascii=False)}\n</event_reading_block_json>\n\n<materialized_track_cards_json>\n{json.dumps(materialized_track_cards, ensure_ascii=False)}\n</materialized_track_cards_json>\n\n<track_context_events_json>\n{json.dumps(context_events, ensure_ascii=False)}\n</track_context_events_json>\n\n<previous_events_json>\n{json.dumps(previous, ensure_ascii=False)}\n</previous_events_json>\n'
 
 def build_event_writer_repair_prompt(original_prompt, failed_result, violations):
-    return original_prompt+f'\n请按原角色规则修正结构或证据校验错误，保留同一 Event 的归属、人物、原话的比喻及不确定程度。正文应控制在 1000 字以内；这是写作硬上限而非目标，不得凑字。若正文过长，优先压缩逐轮复述、旁支、并列堆例和重复解释，仍须保留不可替代的原话锚点、真实转折、关键因果、承诺条件和实际落点。不要新增事实、改变边界，或按词句数量机械改写文风。重新核对 self_review。\n'+json.dumps({'violations':violations,'failed_result':failed_result},ensure_ascii=False)
+    extra = []
+    if any('kept_details' in item for item in violations):
+        extra.append('HARD LIMIT: kept_details must contain at most 6 items. Keep only the 6 most essential anchors; move lower-priority items to discarded_details or omit them. Do not preserve more than 6 by rephrasing or splitting items.')
+    if any('正文超过容错上限' in item for item in violations):
+        extra.append(f'HARD LIMIT: event_draft must be no longer than {EVENT_BODY_ACCEPT_MAX_CHARS} characters and should target {EVENT_WRITER_GUIDE_MAX_CHARS} characters or fewer.')
+    suffix = ('\n' + '\n'.join(extra)) if extra else ''
+    return original_prompt+f'\n请按原角色规则修正结构或证据校验错误，保留同一 Event 的归属、人物、原话的比喻及不确定程度。正文应控制在 1000 字以内；这是写作硬上限而非目标，不得凑字。若正文过长，优先压缩逐轮复述、旁支、并列堆例和重复解释，仍须保留不可替代的原话锚点、真实转折、关键因果、承诺条件和实际落点。不要新增事实、改变边界，或按词句数量机械改写文风。重新核对 self_review。{suffix}\n'+json.dumps({'violations':violations,'failed_result':failed_result},ensure_ascii=False)
+
+
+def normalize_event_writer_result(result: dict[str, Any]) -> dict[str, Any]:
+    kept = [str(value).strip() for value in result.get('kept_details') or [] if str(value).strip()]
+    if len(kept) > 6:
+        result['kept_details'] = kept[:6]
+    return result
 
 
 def validate_event_writer_result(result: dict[str, Any]) -> list[str]:

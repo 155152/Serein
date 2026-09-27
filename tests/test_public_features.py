@@ -146,7 +146,7 @@ def test_pipeline_agent_jobs_retry_ownership_and_rolling_extension(settings):
 def test_pipeline_model_api_selection_uses_names_and_insufficient_writer_stays_pending(settings,monkeypatch):
     ingest(settings)
     save_settings(settings.database,{'identity':{'user_name':'Nori','ai_name':'Atlas'},
-        'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
+        'models':[{'id':'local','model':'sensenova-6.8-flash-lite','base_url':'https://token.sensenova.cn/v1'}],
         'assignments':{role:'local' for role in ROLES}})
     calls=[]
     async def complete(model,payload):
@@ -154,8 +154,16 @@ def test_pipeline_model_api_selection_uses_names_and_insufficient_writer_stays_p
             request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
         role=request['role'];calls.append(role)
         assert request['identity']['ai_name']=='Atlas'
-        assert payload['messages'][1]['content']==request['prompt']
+        assert payload['messages'][0]['content']==request['rules']
+        duplicated='\n\n'+request['rules']+'\n\n'
+        assert duplicated in request['prompt']
+        assert payload['messages'][1]['content']==__import__('serein.extensions.pipeline',fromlist=['api_prompt_for_model']).api_prompt_for_model(request)
+        assert request['rules'] not in payload['messages'][1]['content']
         assert 'max_tokens' not in payload and 'max_completion_tokens' not in payload and 'max_output_tokens' not in payload
+        if role=='event_writer':
+            assert payload['reasoning_effort']=='none'
+        else:
+            assert 'reasoning_effort' not in payload
         result=output_for(role,request)
         if role=='event_writer':
             result.update(evidence_sufficient=False,recallable=False,title='',event_draft='',kept_details=[])

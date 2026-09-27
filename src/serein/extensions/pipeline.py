@@ -7,7 +7,7 @@ from ..core.store import Store, Conflict, encode, digest, now
 from ..deployment import identity, task_model, read_settings
 from .pipeline_limits import blocks, allowed_ids
 from ..compat.events import Events, reference_blockers
-from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
+from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units, fill_missing_existing_track_updates
 from . import pipeline_latest as latest
 from .pipeline_config import snapshot, execution
 from .pipeline_images import freeze_images, verify_images, bind_transcriptions, verify_transcriptions, decision, expire_completed_media
@@ -18,8 +18,67 @@ TZ=timezone(timedelta(hours=8))
 CONTRACT='public-event-message-tracks-v5'
 
 
+def parse_model_json(raw):
+    """Parse a model JSON response, tolerating markdown fences and surrounding prose.
+
+    SenseNova 6.8 Flash Lite intermittently wraps JSON in a ```json fence or surrounds
+    it with explanatory prose. Strip the fence; if a bare parse still fails,
+    extract the outermost {...} object. Only raise JSONDecodeError when no JSON can
+    be recovered, so the caller's retry contract stays intact.
+    """
+    text = str(raw or '')
+    fenced = re.fullmatch(r'\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*', text, re.S | re.I)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    return json.loads(text)
+
+
 class RoutingRecoveryError(ValueError):
     """A durable route cannot be proved safe to use for its frozen batch."""
+
+
+def api_timeout_seconds(role, prompt_chars, configured):
+    base=max(30,int(configured))
+    if role=='event_writer' or (role=='track_router' and prompt_chars>=50000):
+        return min(1800,max(base,base*2))
+    return base
+
+
+def api_prompt_for_model(request):
+    """Compact an API-bound prompt without mutating the frozen request contract."""
+    prompt=str(request.get('prompt') or '')
+    rules=str(request.get('rules') or '')
+    duplicated_rules='\n\n'+rules+'\n\n'
+    if rules and duplicated_rules in prompt:
+        prompt=prompt.replace(duplicated_rules,'\n\n',1)
+    if request.get('role')!='event_writer':
+        return prompt
+    for tag in ('event_reading_block_json','materialized_track_cards_json','track_context_events_json','previous_events_json'):
+        pattern=re.compile(r'(<'+re.escape(tag)+r'>\n)(.*?)(\n</'+re.escape(tag)+r'>)',re.S)
+        match=pattern.search(prompt)
+        if match is None:
+            continue
+        try:
+            payload=json.loads(match.group(2))
+        except json.JSONDecodeError:
+            continue
+        if tag=='event_reading_block_json' and isinstance(payload,list):
+            payload=[{key:value for key,value in item.items()
+                      if key!='saved_snowflake'
+                      and not (key=='memory_event_source' and value is False)
+                      and not (key=='attachment_refs' and value==[])}
+                     if isinstance(item,dict) else item for item in payload]
+        compact=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
+        prompt=prompt[:match.start(2)]+compact+prompt[match.end(2):]
+    return prompt
 
 
 def initialize(database):
@@ -554,6 +613,7 @@ def validate(request,output):
         return
     with latest.identity_scope(request['identity']):
         if role=='track_router':
+            fill_missing_existing_track_updates(output,request['active_tracks'])
             assignments,_,_=normalize_event_track_message_output(output,request['messages'],request['active_tracks'],session_id='validate',next_track_ordinal=1)
             routing_units(request['messages'],assignments)
         elif role=='event_curator':
@@ -565,6 +625,7 @@ def validate(request,output):
                 bind_transcriptions(output,request.get('images',[]))
                 latest.normalize_event_curator_output(decision(output),request['component'])
         else:
+            latest.normalize_event_writer_result(output)
             errors=latest.validate_event_writer_result(output)
             if errors:raise ValueError('; '.join(errors))
 
@@ -623,8 +684,12 @@ async def job(database,batch,request,key,runner):
     progress(stage=request['role'],batch_id=batch['id'],completed=completed,total=total,job_id=identifier)
     if row['output_json']:return json.loads(row['output_json'])
     config=snapshot(database,batch['id']);policy=config['policy']
-    prompt_chars=len(request['prompt'])+len(request['rules'])
-    progress(prompt_chars=prompt_chars,timeout_seconds=policy['timeout_seconds'])
+    model=config['models'].get(request.get('execution',{}).get('task',request['role'])) if policy['execution_mode']!='agent' else None
+    prompt=request['prompt']
+    api_prompt=api_prompt_for_model(request) if model else prompt
+    prompt_chars=len(api_prompt)+len(request['rules'])
+    request_timeout=api_timeout_seconds(request['role'],prompt_chars,policy['timeout_seconds'])
+    progress(prompt_chars=prompt_chars,timeout_seconds=request_timeout)
     if prompt_chars>policy['max_prompt_chars']:
         raise ValueError(
             f"当前 {request['role']} 提示词共 {prompt_chars} 字符，超过 {policy['max_prompt_chars']} 字符上限；"
@@ -636,22 +701,24 @@ async def job(database,batch,request,key,runner):
     if request['role']=='event_writer' and request.get('images'):
         raise ValueError('Event Writer 只接收图片转录，不接收原图')
     verify_images(request.get('images',[]))
-    model=config['models'].get(request.get('execution',{}).get('task',request['role'])) if policy['execution_mode']!='agent' else None
     if not runner and not model:
         raise AwaitAgent({'status':'awaiting_agent','job_id':identifier,'role':request['role'],'request':request,
             'instructions':'Configure an MCP agent as described in Settings > Agent guide, read the frozen prompt, submit with pipeline_submit and call pipeline_next again.'})
     if runner:output=await runner(request['role'],request)
     else:
-        from ..model_runtime import complete
-        prompt=request['prompt']
+        from ..model_runtime import complete, non_thinking_options
+        prompt=api_prompt
         for attempt in range(3):
             progress(attempt=attempt+1,stage=request['role'])
             raw='';received=False
             try:
                 content=([{'type':'text','text':prompt}]+[{'type':'image_url','image_url':{'url':item['url']}} for item in request.get('images',[])]) if request.get('images') else prompt
-                response=await asyncio.wait_for(complete({**model,'request_timeout_seconds':policy['timeout_seconds']},
-                    {'messages':[{'role':'system','content':request['rules']},{'role':'user','content':content}],
-                     'response_format':{'type':'json_object'}}),timeout=policy['timeout_seconds']+20)
+                payload={'messages':[{'role':'system','content':request['rules']},{'role':'user','content':content}],
+                         'response_format':{'type':'json_object'}}
+                if request['role']=='event_writer':
+                    payload.update(non_thinking_options(model))
+                response=await asyncio.wait_for(complete({**model,'request_timeout_seconds':request_timeout},payload),
+                    timeout=request_timeout+20)
                 received=True
                 choice=response['choices'][0]
                 raw=choice['message'].get('content') or ''
@@ -666,7 +733,7 @@ async def job(database,batch,request,key,runner):
                         if reasoning_tokens is not None:
                             suffix+=f'，其中思考使用 {reasoning_tokens} tokens'
                     raise ValueError('模型未返回最终 JSON 内容'+suffix)
-                output=json.loads(raw)
+                output=parse_model_json(raw)
                 validate(request,output)
                 record_attempt(database,identifier,raw)
                 break
@@ -811,6 +878,11 @@ async def transcribe_component(database,batch,component,index,runner,*,key_prefi
         rows=[item for item in bound if item['source_message_id']==message['id']]
         if rows:message['image_transcription']={'status':'complete','items':rows}
     return True
+
+
+def rollover_oversized_rolling_events(component,plan,input_limit):
+    limit=max(1,int(input_limit))
+    return plan
 
 
 def event_writer_concurrency(database,batch,runner):

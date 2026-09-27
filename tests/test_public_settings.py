@@ -516,6 +516,8 @@ def test_native_task_options_and_cache_validation(deployment):
     assert non_thinking_options({'model':'deepseek-ai/DeepSeek-V4-Flash','base_url':'https://api.siliconflow.cn/v1'})=={
         'enable_thinking':False}
     assert non_thinking_options({'model':'ordinary','base_url':'https://provider.example/v1'})=={}
+    assert non_thinking_options({'model':'sensenova-6.8-flash-lite','base_url':'https://token.sensenova.cn/v1'})=={
+        'reasoning_effort':'none'}
     _,_,deepseek_anthropic=request_for({'id':'deepseek','model':'deepseek-flash',
         'base_url':'https://api.deepseek.com/anthropic','protocol':'anthropic'},
         {'messages':[{'role':'user','content':'extract'}],

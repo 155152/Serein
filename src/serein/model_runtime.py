@@ -25,10 +25,13 @@ def non_thinking_options(model):
     host = (urlsplit(base_url).hostname or '').lower()
     name = str(model.get('model') or '').lower()
     deepseek = 'deepseek' in host or 'deepseek' in name
+    sensenova = host.endswith('sensenova.cn') and name.startswith('sensenova-')
     if str(model.get('protocol') or 'openai') == 'anthropic':
         return {'reasoning': {'effort': 'none'}} if deepseek else {}
     if 'siliconflow.' in host:
         return {'enable_thinking': False}
+    if sensenova:
+        return {'reasoning_effort': 'none'}
     return {'thinking': {'type': 'disabled'}} if deepseek else {}
 
 

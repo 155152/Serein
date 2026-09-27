@@ -124,9 +124,46 @@ def reference_blockers(conn, key):
         'SELECT 1 FROM evidence_bindings e JOIN sources es ON es.id=e.source_id '
         'JOIN sources ss ON ss.source_key=es.source_key JOIN evidence_bindings s ON s.source_id=ss.id '
         'JOIN documents d ON d.id=s.document_id '
-        "WHERE e.document_id=? AND e.active=1 AND s.active=1 AND d.kind='scene' AND d.lifecycle='active' LIMIT 1",(key,)).fetchone():
+        'JOIN revisions r ON r.document_id=d.id AND r.number=d.revision '
+        "WHERE e.document_id=? AND e.active=1 AND s.active=1 AND d.kind='scene' AND d.lifecycle='active' "
+        "AND COALESCE(json_extract(r.metadata_json,'$.memory_value_source'),'')<>'automatic_event_scene' LIMIT 1",(key,)).fetchone():
         reasons.append('active_scene_dependency')
     return reasons
+
+
+def _archive_superseded_auto_scenes(conn, successor_event_id):
+    """Retire derived Scenes only after a successor Event has its own promoted Scene.
+
+    Automatic Event->Scene projections are replaceable derived views, not independent
+    authored memories. They must not block Event evolution forever. Authored/manual
+    Scenes remain protected by reference_blockers().
+    """
+    family = FactEventStore._replacement_family_payload(conn, successor_event_id)['family_ids']
+    if not family:
+        return []
+    placeholders = ','.join('?' for _ in family)
+    rows = conn.execute(
+        "SELECT d.id FROM documents d "
+        "JOIN revisions r ON r.document_id=d.id AND r.number=d.revision "
+        "JOIN fact_events f ON f.item_id=json_extract(r.metadata_json,'$.promoted_from_event.id') "
+        "WHERE d.kind='scene' AND d.lifecycle='active' "
+        "AND json_extract(r.metadata_json,'$.memory_value_source')='automatic_event_scene' "
+        f"AND json_extract(r.metadata_json,'$.promoted_from_event.id') IN ({placeholders}) "
+        "AND json_extract(r.metadata_json,'$.promoted_from_event.id')<>? "
+        "AND f.status='superseded' ORDER BY d.id",
+        (*family, successor_event_id),
+    ).fetchall()
+    if not rows:
+        return []
+    timestamp = now()
+    retired = [row[0] for row in rows]
+    for scene_id in retired:
+        conn.execute(
+            "UPDATE documents SET lifecycle='archived',updated_at=? WHERE id=? AND lifecycle='active'",
+            (timestamp, scene_id),
+        )
+        conn.execute('INSERT INTO index_outbox(document_id) VALUES (?)', (scene_id,))
+    return retired
 
 
 def _auto_promote_pipeline_event(conn, event_id):
@@ -164,6 +201,7 @@ def _auto_promote_pipeline_event(conn, event_id):
 
     promoted = store.promoted_scene(event_id)
     if promoted:
+        _archive_superseded_auto_scenes(conn, event_id)
         detail["auto_scene"] = {"status": "already_promoted", "scene_id": promoted["id"]}
         conn.execute(
             "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",
@@ -191,6 +229,7 @@ def _auto_promote_pipeline_event(conn, event_id):
         write_contract="event-to-scene-auto-v1",
         actor="event_pipeline",
     )
+    _archive_superseded_auto_scenes(conn, event_id)
     detail["auto_scene"] = {"status": "promoted", "scene_id": result["id"]}
     conn.execute(
         "UPDATE pipeline_event_details SET details_json=? WHERE event_id=?",

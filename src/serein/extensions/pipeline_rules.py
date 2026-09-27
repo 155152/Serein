@@ -96,6 +96,41 @@ def dialogue_unit_is_complete(unit: list[dict[str, Any]]) -> bool:
         return False
     return any(item.get("role") == "assistant" for item in unit[1:])
 
+def fill_missing_existing_track_updates(output: dict[str, Any], active_tracks: list[dict[str, Any]]) -> dict[str, Any]:
+    assignments = output.get('message_assignments')
+    updates = output.get('track_updates')
+    if not isinstance(assignments, list) or not isinstance(updates, list):
+        return output
+    existing = {str(track.get('track_id') or ''): track for track in active_tracks if str(track.get('track_id') or '')}
+    used = []
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        primary = str(assignment.get('primary_track_ref') or '').strip()
+        if primary:
+            used.append(primary)
+        for ref in assignment.get('context_track_refs') or []:
+            ref = str(ref or '').strip()
+            if ref:
+                used.append(ref)
+    present = {str(item.get('track_ref') or '').strip() for item in updates if isinstance(item, dict)}
+    missing_existing = [ref for ref in dict.fromkeys(used) if ref in existing and ref not in present]
+    if not missing_existing:
+        return output
+    repaired = list(updates)
+    for ref in missing_existing:
+        track = existing[ref]
+        repaired.append({
+            'track_ref': ref,
+            'subject': str(track.get('subject') or '').strip(),
+            'throughline': str(track.get('throughline') or '').strip(),
+            'event_policy': str(track.get('event_policy') or 'default').strip() or 'default',
+            'status': str(track.get('status') or 'active').strip() or 'active',
+        })
+    output['track_updates'] = repaired
+    return output
+
+
 def normalize_event_track_message_output(
     output: dict[str, Any],
     messages: list[dict[str, Any]],
@@ -183,8 +218,16 @@ def normalize_event_track_message_output(
             track_ref not in existing and not re.fullmatch(r"new:[1-9][0-9]*", track_ref)
         ):
             raise ValueError("Track Router updated an invalid or repeated Track")
-        if not subject or len(subject) > 160 or not throughline or len(throughline) > 600:
+        if not subject or not throughline:
             raise ValueError("Track Router update needs bounded subject and throughline")
+        # Truncate overlong summaries instead of failing the whole batch. SenseNova
+        # Flash Lite sometimes writes a full narrative arc into throughline; a hard
+        # cut keeps the Track usable while the empty-check above still catches a
+        # genuinely missing field.
+        if len(subject) > 160:
+            subject = subject[:159] + "…"
+        if len(throughline) > 600:
+            throughline = throughline[:597] + "…"
         if status not in {"active", "parked"}:
             raise ValueError("Track Router update has invalid status")
         existing_policy = str((existing.get(track_ref) or {}).get("event_policy") or "default")
