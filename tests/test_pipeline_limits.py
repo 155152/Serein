@@ -415,8 +415,9 @@ def test_empty_structured_output_reports_length_exhaustion(settings,monkeypatch)
         return {'choices':[{'message':{'content':''},'finish_reason':'length'}],
                 'usage':{'completion_tokens':8192,'completion_tokens_details':{'reasoning_tokens':8192}}}
     monkeypatch.setattr('serein.model_runtime.complete',empty)
-    with pytest.raises(ValueError,match='未返回最终 JSON 内容.*输出预算耗尽.*8192'):
-        asyncio.run(p.advance(settings.database,include_recent=True))
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert result['status']=='paused'
+    assert '未返回最终 JSON 内容' in result['reason'] and '输出预算耗尽' in result['reason'] and '8192' in result['reason']
     assert len(calls)==3 and all('max_tokens' not in payload for payload in calls)
     with Store(settings.database,read_only=True) as store:
         attempts=store.conn.execute('SELECT output_text,error FROM pipeline_attempts ORDER BY id').fetchall()

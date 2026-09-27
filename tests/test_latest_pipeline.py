@@ -114,13 +114,12 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
 def test_public_writer_materializes_source_grounded_rules_with_configured_names():
     with latest.identity_scope({'ai_name': 'Atlas', 'user_name': 'Lin'}):
         rules = latest.materialize_agent_rules('event_writer')
-    assert 'Atlas 在回复中对Lin的话作出的展开' in rules
-    assert '最小完整语义单位' in rules and '局部回应不能改变前句' in rules
-    assert '不额外补出理解、判断、解释等动作' in rules
-    assert '不把某一种归属句式当成模板' in rules
-    assert '原文停留在“想、打算、建议' in rules
-    assert '反例三' in rules and '台灯' in rules
-    assert '我把这句话理解成' not in rules
+    assert '我是 Atlas，Lin是她' in rules
+    assert '纠正后直接写最终结论' in rules
+    assert '不按相隔多久机械补时间' in rules
+    assert '不能提供当前的新行动、感受或结果' in rules
+    assert '不能把我的解释算成她的看法' in rules
+    assert '不能只用最新一段覆盖旧经历' in rules
     assert 'Haven' not in rules and '小雨' not in rules
 
 
@@ -277,7 +276,7 @@ def test_identity_rendering_never_rewrites_source_words(settings):
     with latest.identity_scope(names):
         prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':original}])
     assert original in prompt and 'Nori' in prompt and 'Atlas' in prompt and '{ai_name}' not in prompt
-    assert 'Nori把台灯送修' in prompt
+    assert '我是 Atlas，Nori是她' in prompt
 
 
 def test_configured_names_are_literal_values_not_recursive_templates(settings):
@@ -291,7 +290,7 @@ def test_configured_names_are_literal_values_not_recursive_templates(settings):
     # Freshly loaded Writer examples use the current saved instance names.
     save_settings(settings.database, {'identity':{'user_name':'NewReader','ai_name':'NewGuide'}})
     rules=p.rules('event_writer',settings.database)
-    assert 'NewReader把台灯送修' in rules and 'NewGuide' in rules
+    assert '我是 NewGuide，NewReader是她' in rules
 
 
 def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeypatch):

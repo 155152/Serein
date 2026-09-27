@@ -195,6 +195,8 @@ async def work(settings,key,arguments):
             protected.extend(result.get('protected_deferrals',[]))
             result={**result,'deferred':deferred,'skipped':skipped,'protected_deferrals':protected}
             progress(events=events)
+            if result['status']=='paused' and result.get('job_id'):
+                continue  # The held scope is excluded; try independent chats.
             if result['status']!='processed':return {**result,'events':events}
             if not result.get('processed_originals',0):
                 return {**result,'status':'current','events':events,'note':'本批需要后续上下文，原话仍待整理；不会反复请求同一批。'}

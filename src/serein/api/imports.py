@@ -56,6 +56,8 @@ def routes(settings,auth):
         if value.get('stage')=='event_evidence':
             value.update(status='idle',stage='idle',result=None,job_id='',error='旧证据整理阶段已撤掉，继续整理会进入下一阶段。')
         with Store(settings.database,read_only=True) as store:
+            if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_batches'").fetchone():
+                value['paused_batches']=[json.loads(row[0]) for row in store.conn.execute("SELECT result_json FROM pipeline_batches WHERE status='paused_failure' ORDER BY rowid")]
             value['failed_images']=[dict(row) for row in store.conn.execute(
                 'SELECT sha256,failures,error FROM pipeline_image_failures WHERE failures>=3 ORDER BY updated_at DESC')]
             quiet=value['status']=='completed' and value.get('stage') in ('settled_today','waiting_settlement_window')
@@ -74,6 +76,13 @@ def routes(settings,auth):
                 'SELECT id,attempt,created_at,error,length(output_text) output_chars FROM pipeline_attempts WHERE job_id=? ORDER BY id DESC LIMIT 5',
                 (value.get('job_id',''),))] if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_attempts'").fetchone() else []
         return value
+
+    @router.post('/v1/pipeline/retry-batch')
+    async def retry_pipeline_batch(body:dict):
+        from ..work_tasks import execute
+        from ..extensions.pipeline import retry_batch
+        async def retry():return retry_batch(settings.database,body.get('batch_id'))
+        return await execute(settings.database,'pipeline',retry)
 
     @router.post('/v1/pipeline/retry-image')
     async def retry_image(body:dict):
