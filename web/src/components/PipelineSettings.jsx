@@ -12,7 +12,7 @@ export function PipelineSettings({onOpenSummary}) {
   const needsRepair=work?.status==='needs_repair'||work?.result?.status==='needs_repair';
   const failure=work?.error||(needsRepair?work?.result?.reason:'');
   const candidateOverflows=work?.result?.candidate_overflow_deferrals||[];
-  const stages={idle:'尚未开始',queued:'等待后台处理',starting:'正在准备',track_router:'归线',event_curator:'切分整理',event_writer:'Event 写作',awaiting_agent:'等待 Agent',processed:'已保存',current:'整理完成',needs_repair:'归线材料待修复',rebuilt:'计划已重建'};
+  const stages={paused:'本批已暂停',idle:'尚未开始',queued:'等待后台处理',starting:'正在准备',track_router:'归线',event_curator:'切分整理',event_writer:'Event 写作',awaiting_agent:'等待 Agent',processed:'已保存',current:'整理完成',needs_repair:'归线材料待修复',rebuilt:'计划已重建'};
   async function call(action,body) {
     const response=await fetch('/__serein/pipeline/'+action,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const result=await response.json();
@@ -44,6 +44,16 @@ export function PipelineSettings({onOpenSummary}) {
   function beginRebuild() {
     setRebuildTarget(work?.result?.batch_id||work?.batch_id||'');
     rebuildDialog.current.showModal();
+  }
+  async function retryBatch(batchId) {
+    if(busy||running)return;
+    setBusy(true);
+    try {
+      const result=await call('retry-batch',{batch_id:batchId});
+      if(result.status==='busy')throw new Error('整理任务正在运行，请稍后重试。');
+      accept(await call('next',{include_recent:true}));
+      setStatus('已恢复批次，从失败步骤继续，成功结果保留。');
+    }catch(error){setStatus(error.message);}finally{setBusy(false);}
   }
   async function retryImage(sha256) {
     if(busy||running)return;
@@ -101,6 +111,7 @@ export function PipelineSettings({onOpenSummary}) {
       {(work.failed_images||[]).map(image=><p className="import-error" key={image.sha256}>
         图片 {image.sha256.slice(0,8)} 转录失败三次，已暂停自动重试；依赖它的原话仍保留。
         <button type="button" disabled={busy||running} onClick={()=>retryImage(image.sha256)}>重试这张图片</button></p>)}
+      {(work.paused_batches||[]).map(batch=><p className="import-error" key={batch.batch_id}>本批累计失败三次，已暂停：{batch.reason}。同一聊天的后续整理等待它恢复，其他聊天可继续。<button type="button" disabled={busy||running} onClick={()=>retryBatch(batch.batch_id)}>重试此批次</button></p>)}
       {failure&&<p className="import-error">{needsRepair?'待修复原因':'失败原因'}：{failure}</p>}
       {needsRepair&&<p>批次：<code>{work.result?.batch_id||work.batch_id}</code>。原话与已完成步骤保留。先重新校验以恢复历史归线；无法恢复时，可明确作废本批计划并重新归线。不会跳过原话或删除已保存的 Event。</p>}
       {task&&<p>等待 {stages[task.role]||task.role}：下载任务交给 Agent，再提交返回的 JSON。</p>}</div>}

@@ -40,6 +40,10 @@ def runtime_revision():
     return digest(encode({'contract':CONTRACT,'code':code,'rules':role_rules}))
 
 
+class PausedBatch(ValueError):
+    pass
+
+
 class RoutingRecoveryError(ValueError):
     """A durable route cannot be proved safe to use for its frozen batch."""
 
@@ -57,6 +61,7 @@ def initialize(database):
             CREATE TABLE IF NOT EXISTS pipeline_schedule(day TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS pipeline_attempts(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL,attempt INTEGER NOT NULL,
                 created_at TEXT NOT NULL,output_text TEXT NOT NULL,error TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pipeline_job_failures(job_id TEXT PRIMARY KEY,failures INTEGER NOT NULL,error TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pipeline_media(batch_id TEXT NOT NULL,source_message_id INTEGER NOT NULL,
                 position INTEGER NOT NULL,sha256 TEXT NOT NULL,mime_type TEXT NOT NULL,body BLOB NOT NULL,
                 PRIMARY KEY(batch_id,source_message_id,position));
@@ -71,7 +76,7 @@ def initialize(database):
         # of per-message raw_processing rows. Retire only unfinished frozen plans
         # that crossed one of those explicit boundaries.
         store.conn.execute("""UPDATE pipeline_batches SET status='superseded_import_boundary'
-            WHERE status IN ('pending','needs_repair','routing_only','routed') AND EXISTS (
+            WHERE status IN ('pending','needs_repair','routing_only','routed','paused_failure') AND EXISTS (
                 SELECT 1 FROM json_each(input_json,'$.routing_messages') m
                 JOIN pipeline_import_boundaries b
                   ON b.upload_id=json_extract(m.value,'$.metadata.import_upload_id') AND b.released=0)""")
@@ -80,7 +85,7 @@ def initialize(database):
         # older downstream request through job()'s durable resume path.
         revision=runtime_revision()
         store.conn.execute("""UPDATE pipeline_batches SET status='superseded_protocol'
-            WHERE status IN ('pending','needs_repair','routing_only','routed')
+            WHERE status IN ('pending','needs_repair','routing_only','routed','paused_failure')
               AND (json_extract(input_json,'$.contract') IS NULL
                    OR json_extract(input_json,'$.contract')<>?
                    OR json_extract(input_json,'$.runtime_revision') IS NULL
@@ -163,7 +168,7 @@ def new_batch(database,include_recent,clock=None):
     if not include_recent and current<watermark:return None
     cutoff=watermark-timedelta(minutes=20)
     with Store(database) as store,store.transaction(immediate=True):
-        old=store.conn.execute("SELECT * FROM pipeline_batches WHERE status IN ('pending','needs_repair') ORDER BY COALESCE(json_extract(input_json,'$.queue_order'),rowid),rowid LIMIT 1").fetchone()
+        old=store.conn.execute("SELECT * FROM pipeline_batches WHERE status IN ('pending','needs_repair') AND scope NOT IN (SELECT scope FROM pipeline_batches WHERE status='paused_failure') ORDER BY COALESCE(json_extract(input_json,'$.queue_order'),rowid),rowid LIMIT 1").fetchone()
         if old:
             if old['status']=='needs_repair':return dict(old)
             old_data=json.loads(old['input_json'])
@@ -216,7 +221,9 @@ def new_batch(database,include_recent,clock=None):
             complete_upload=" AND (json_extract(r.metadata_json,'$.import_upload_id') IS NULL OR json_extract(r.metadata_json,'$.import_upload_id') IN (SELECT id FROM file_imports WHERE cursor=json_array_length(payload_json,'$.entries')))"
         import_boundary=" AND NOT EXISTS (SELECT 1 FROM pipeline_import_boundaries b WHERE b.upload_id=json_extract(r.metadata_json,'$.import_upload_id') AND b.released=0) AND NOT EXISTS (SELECT 1 FROM pipeline_image_holds h WHERE h.raw_id=r.id AND h.event_hash=r.event_hash)"
         scopes=store.conn.execute('SELECT DISTINCT r.source,r.session_id FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id').fetchall()
+        held_scopes={row[0] for row in store.conn.execute("SELECT scope FROM pipeline_batches WHERE status='paused_failure'")}
         for source,session in scopes:
+            if digest(encode([source,session]))[:20] in held_scopes:continue
             rows=[task_message(row) for row in store.conn.execute('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id',(source,session))]
             eligible=[r for r in rows if datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))<=watermark]
             chunks=blocks(eligible,policy['max_input_chars'])
@@ -794,6 +801,36 @@ class AwaitAgent(Exception):
     def __init__(self,task):self.task=task
 
 
+def stage_failures(database,job_id):
+    with Store(database,read_only=True) as store:
+        row=store.conn.execute('SELECT failures FROM pipeline_job_failures WHERE job_id=?',(job_id,)).fetchone()
+    return row[0] if row else 0
+
+
+def fail_stage(database,batch,job_id,error):
+    # Daytime route-only work is not a frozen settlement batch.
+    if batch['id'].startswith('route:'):return
+    from ..work_tasks import failure_reason
+    reason=failure_reason(error)
+    with Store(database) as store,store.transaction(immediate=True):
+        store.conn.execute("INSERT INTO pipeline_job_failures VALUES (?,1,?) ON CONFLICT(job_id) DO UPDATE SET failures=failures+1,error=excluded.error",(job_id,reason))
+        count=store.conn.execute('SELECT failures FROM pipeline_job_failures WHERE job_id=?',(job_id,)).fetchone()[0]
+        if count>=3:
+            result={'status':'paused','batch_id':batch['id'],'job_id':job_id,'reason':reason,'failures':count}
+            store.conn.execute("UPDATE pipeline_batches SET status='paused_failure',result_json=? WHERE id=?",(encode(result),batch['id']))
+    if count>=3:raise PausedBatch(reason) from error
+
+
+def retry_batch(database,batch_id):
+    initialize(database)
+    with Store(database) as store,store.transaction(immediate=True):
+        row=store.conn.execute('SELECT status FROM pipeline_batches WHERE id=?',(batch_id,)).fetchone()
+        if row is None or row['status']!='paused_failure':raise ValueError('找不到暂停的批次')
+        store.conn.execute('DELETE FROM pipeline_job_failures WHERE job_id IN (SELECT id FROM pipeline_jobs WHERE batch_id=? AND output_json IS NULL)',(batch_id,))
+        store.conn.execute("UPDATE pipeline_batches SET status='pending',result_json=NULL WHERE id=?",(batch_id,))
+    return {'status':'resumed','batch_id':batch_id}
+
+
 async def job(database,batch,request,key,runner):
     from ..work_tasks import progress
     identifier=batch['id']+':'+key
@@ -843,11 +880,12 @@ async def job(database,batch,request,key,runner):
         try:output=await runner(request['role'],request)
         except Exception as error:
             if image:record_image_failure(database,image,error)
+            else:fail_stage(database,batch,identifier,error)
             raise
     else:
         from ..model_runtime import complete
         prompt=request['prompt']
-        attempts=FAILURE_LIMIT-image_failures(database,image['sha256']) if image else 3
+        attempts=FAILURE_LIMIT-image_failures(database,image['sha256']) if image else max(1,3-stage_failures(database,identifier))
         for attempt in range(attempts):
             progress(attempt=attempt+1,stage=request['role'])
             raw='';received=False
@@ -880,13 +918,17 @@ async def job(database,batch,request,key,runner):
                 record_attempt(database,identifier,raw,reason)
                 progress(error=reason,attempt=attempt+1)
                 if image:record_image_failure(database,image,error)
+                else:fail_stage(database,batch,identifier,error)
                 if (not image and (not received or not isinstance(error,ValueError))) or attempt==attempts-1:raise
                 correction='\n请按原角色规则纠正结构或证据校验错误，只返回完整 JSON。保留人物归属、比喻及不确定程度，不按词句数量改写文风。编号使用原始编号，不得按展示位置重新编号。\n'+encode({'validation_error':reason,'allowed_ids':allowed_ids(request)})
                 room=policy['max_prompt_chars']-len(request['rules'])-len(request['prompt'])-len(correction)-80
                 if room<0:raise ValueError('提示词上限不足以容纳纠错请求，请减小每批输入。') from error
                 prompt=request['prompt']+correction+'\n上一份不合格输出（仅用于纠错，可能截断）：\n'+raw[:min(room,10000)]
         progress(error='')
-    submit(database,identifier,output)
+    try:submit(database,identifier,output)
+    except Exception as error:
+        if not image:fail_stage(database,batch,identifier,error)
+        raise
     progress(completed=completed+1)
     return output
 
@@ -1107,7 +1149,7 @@ async def first_event_writer_pass(database,batch,component,plan,index,runner):
     except ExceptionGroup as errors:
         # TaskGroup wraps the model/validation failure. Preserve the existing
         # durable diagnostic type while cancelled sibling jobs remain resumable.
-        raise errors.exceptions[0]
+        raise next((error for error in errors.exceptions if isinstance(error,PausedBatch)),errors.exceptions[0])
     return results
 
 
@@ -1203,6 +1245,9 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                 event_results=[(event,written) for event,written in event_results if event['event_ref'] in accepted]
             plans.append((component,plan,event_results))
         return settle(database,batch,data,routed,plans)
+    except PausedBatch:
+        with Store(database,read_only=True) as store:
+            return json.loads(store.conn.execute('SELECT result_json FROM pipeline_batches WHERE id=?',(batch['id'],)).fetchone()[0])
     except AwaitAgent as wait:return wait.task
     except RoutingRecoveryError as error:return mark_needs_repair(database,batch,error)
 

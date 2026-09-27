@@ -143,3 +143,97 @@ def test_failed_writer_resume_reuses_successful_router_and_curator(settings):
         return output_for(role, request)
     assert asyncio.run(p.advance(settings.database, include_recent=True, runner=succeeds))['events'] == 1
     assert resumed == ['event_writer']
+
+
+def test_paused_writer_holds_its_chat_but_allows_another_and_resumes_frozen_step(settings):
+    from serein.core.store import Store
+    ingest(settings)
+    async def fails(role, request):
+        if role == 'event_writer':raise ValueError('synthetic broken writer')
+        return output_for(role, request)
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            asyncio.run(p.advance(settings.database, include_recent=True, runner=fails))
+    paused = asyncio.run(p.advance(settings.database, include_recent=True, runner=fails))
+    assert paused['status'] == 'paused' and paused['failures'] == 3
+    ingest(settings, 2)
+    raw_archive(settings).ingest([
+        {'source_event_id': 'other-u', 'session_id': 'other', 'role': 'user', 'text': 'Pick a notebook',
+         'created_at': '2025-01-01T00:00:00Z'},
+        {'source_event_id': 'other-a', 'session_id': 'other', 'role': 'assistant', 'text': 'Use the blue one',
+         'created_at': '2025-01-01T00:01:00Z'}], source='test')
+    async def succeeds(role, request):return output_for(role, request)
+    result = asyncio.run(p.advance(settings.database, include_recent=True, runner=succeeds))
+    assert result['events'] == 1 and result['batch_id'] != paused['batch_id']
+    assert asyncio.run(p.advance(settings.database, include_recent=True, runner=succeeds))['status'] == 'current'
+    with Store(settings.database, read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing WHERE raw_id IN (1,2,3,4)').fetchone()[0] == 0
+        assert store.conn.execute('SELECT count(*) FROM pipeline_jobs WHERE batch_id=? AND output_json IS NOT NULL',
+                                  (paused['batch_id'],)).fetchone()[0] == 2
+    p.retry_batch(settings.database, paused['batch_id'])
+    resumed = []
+    async def resume(role, request):
+        resumed.append(role)
+        return output_for(role, request)
+    assert asyncio.run(p.advance(settings.database, include_recent=True, runner=resume))['events'] == 1
+    assert resumed == ['event_writer']
+
+
+def test_pause_budget_persists_api_attempts_and_retry_route_is_authenticated(settings, monkeypatch):
+    from fastapi.testclient import TestClient
+    from serein.api.http import create_app
+    from serein.core.store import Store
+    from serein.deployment import save_settings
+    ingest(settings)
+    save_settings(settings.database, {'pipeline': {'execution_mode': 'api'},
+        'models': [{'id': 'local', 'model': 'synthetic', 'base_url': 'http://127.0.0.1:9/v1'}],
+        'assignments': {role: 'local' for role in p.ROLES}})
+    calls = []
+    async def broken(model, payload):
+        calls.append(1)
+        return {'choices': [{'message': {'content': '{}'}}]}
+    monkeypatch.setattr('serein.model_runtime.complete', broken)
+    paused = asyncio.run(p.advance(settings.database, include_recent=True))
+    assert paused['status'] == 'paused' and len(calls) == 3
+    assert asyncio.run(p.advance(settings.database, include_recent=True))['status'] == 'current'
+    assert len(calls) == 3
+    app = create_app(settings, token='test', live=True)
+    assert TestClient(app).post('/v1/pipeline/retry-batch', json={'batch_id': paused['batch_id']}).status_code == 401
+    client = TestClient(app, headers={'Authorization': 'Bearer test'})
+    assert client.get('/v1/pipeline/status').json()['paused_batches'][0]['batch_id'] == paused['batch_id']
+    assert client.post('/v1/pipeline/retry-batch', json={'batch_id': paused['batch_id']}).json()['status'] == 'resumed'
+    with Store(settings.database, read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM pipeline_job_failures').fetchone()[0] == 0
+        assert store.conn.execute('SELECT count(*) FROM pipeline_attempts').fetchone()[0] == 3
+
+
+def test_continue_worker_moves_to_independent_chat_after_pausing_failed_batch(settings, monkeypatch):
+    from serein.core.store import Store
+    from serein.work_tasks import work
+    ingest(settings)
+    async def fails(role, request):
+        if role == 'event_writer':raise ValueError('synthetic broken writer')
+        return output_for(role, request)
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            asyncio.run(p.advance(settings.database, include_recent=True, runner=fails))
+    with Store(settings.database, read_only=True) as store:
+        bad = store.conn.execute('SELECT id FROM pipeline_batches').fetchone()[0]
+    raw_archive(settings).ingest([
+        {'source_event_id': 'other-u', 'session_id': 'other', 'role': 'user', 'text': 'Choose a notebook',
+         'created_at': '2025-01-01T00:00:00Z'},
+        {'source_event_id': 'other-a', 'session_id': 'other', 'role': 'assistant', 'text': 'Use the blue cover',
+         'created_at': '2025-01-01T00:01:00Z'}], source='test')
+    advance = p._advance
+    results = []
+    async def runner(role, request):
+        if request['batch_id'] == bad and role == 'event_writer':raise ValueError('synthetic broken writer')
+        return output_for(role, request)
+    async def controlled(database, **kwargs):
+        result = await advance(database, runner=runner, **kwargs)
+        results.append(result['status'])
+        return result
+    monkeypatch.setattr(p, '_advance', controlled)
+    result = asyncio.run(work(settings, 'pipeline', {'include_recent': True}))
+    assert results == ['paused', 'processed', 'current']
+    assert result['events'] == 1
