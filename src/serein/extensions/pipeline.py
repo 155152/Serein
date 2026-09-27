@@ -640,8 +640,13 @@ def request_for(database,batch,role,**fields):
             component=fields['component']
             image_messages=image_source_messages(database,component['context_messages'])
             images,missing=writer_images(image_messages,{m['id'] for m in component['messages']})
-            if missing:raise ValueError('绑定图片缺少原图，请补齐附件；原话仍保留')
-            frozen_images=freeze_task_images(database,batch['id'],images,component.get('images',[]))
+            skipped=list(component.get('missing_images') or [])
+            skipped.extend({'source_message_id':source_id,'reason':'original_missing'} for source_id in missing
+                           if not any(row['source_message_id']==source_id for row in skipped))
+            gone={(row['source_message_id'],row.get('position')) for row in skipped}
+            images=[image for image in images if (image['source_message_id'],image['position']) not in gone]
+            frozen_images=freeze_task_images(database,batch['id'],images,component.get('images',[]),missing=skipped)
+            component['missing_images']=skipped
             component['images']=[{key:value for key,value in item.items() if key not in ('url','original_url')}
                                  for item in frozen_images]
             request['images']=[{**item,'evidence_role':'stable' if item['source_message_id'] in {m['id'] for m in component['messages']} else 'context_only'} for item in frozen_images]
@@ -649,6 +654,8 @@ def request_for(database,batch,role,**fields):
                 unavailable={(i['source_message_id'],i['position'],i['sha256']) for i in component.get('unavailable_images',[])}
                 request['images']=[i for i in request['images'] if (i['source_message_id'],i['position'],i['sha256']) not in unavailable]
             prompt=latest.build_event_track_curator_prompt(data['day'],component)
+            if component.get('missing_images'):
+                prompt+='\n以下附件原图缺失，host 已跳过附件。它们没有转录，也不代表图片为空。只整理已有文字与可用材料，不得猜补图片、声称看过图片或把图片内容写成事实：\n'+encode(component['missing_images'])
             if fields.get('pretranscribed'):
                 request['curator_image_transcriptions']=list(component.get('curator_image_transcriptions',[]))
                 request['images']=[]
@@ -679,6 +686,8 @@ def request_for(database,batch,role,**fields):
             verify_transcriptions(request['curator_image_transcriptions'],bound_images)
             request['images']=[]
             request['image_input_mode']='transcriptions_only'
+            if component.get('missing_images'):
+                prompt+='\n以下附件原图缺失，已跳过；不得猜补图片内容或声称看过原图：\n'+encode(component['missing_images'])
             prompt+='\n<curator_image_transcriptions>\n'+encode(request['curator_image_transcriptions'])+'\n</curator_image_transcriptions>'
             prompt+='\n转录包含图片文字与可见画面描述，只是附件材料，不是发送者新说的话。原图未附，不得声称读过原图或猜补未转录内容。上下文图片不扩大归属。缺少指代时可且仅可返回 context_request，字段与 Curator 相同：'+encode({'context_request':{'track_id':component['track_ids'][0],'before_message_id':min(m['id'] for m in component['messages']),'reason':'missing_subject'}})
         if request.get('images'):
@@ -951,6 +960,7 @@ def settle(database,batch,data,routed,plans):
             'protected_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips']],
             'candidate_overflow_deferrals':[entry for _,plan,_ in plans for entry in plan.get('host_deferrals',[])],
             'image_deferrals':[entry for _,plan,_ in plans for entry in plan.get('image_deferrals',[])],
+            'missing_images':[entry for component,_,_ in plans for entry in component.get('missing_images',[])],
             'task_snapshot_compacted':True}
     compacted_input=encode(compact_batch_snapshot(data))
     with Store(database,read_only=True) as store:

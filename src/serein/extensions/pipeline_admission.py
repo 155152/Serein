@@ -55,9 +55,18 @@ def exchanges(messages):
 
 def count_rounds(owned_ids, messages):
     owned = set(owned_ids)
-    return sum({row['role'] for row in unit} == {'user', 'assistant'}
-               and all(int(row['id']) in owned for row in unit)
-               for unit in exchanges(messages))
+    count = 0
+    for unit in exchanges(messages):
+        if {row['role'] for row in unit} != {'user', 'assistant'} or not all(int(row['id']) in owned for row in unit):
+            continue
+        users = {int(row['id']) for row in unit if row['role'] == 'user'}
+        if unit[0]['role'] == 'user' and any(
+            type(target := (row.get('metadata') or {}).get('reply_to_user_message_id')) is int
+            and target not in users for row in unit if row['role'] == 'assistant'
+        ):
+            continue
+        count += 1
+    return count
 
 
 def validate(review, output, component):

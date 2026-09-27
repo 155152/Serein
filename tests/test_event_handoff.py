@@ -24,12 +24,15 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
         'assignments':{role:'local' for role in p.ROLES},'pipeline':{'execution_mode':mode}})
     seen=[];sha=hashlib.sha256(base64.b64decode(PNG.split(',')[1])).hexdigest()
     def check(request):
-        role=request['role'];seen.append(role)
+        role=request['role'];seen.append(request['execution']['task'])
         assert role in ('track_router','event_curator','event_writer')
-        if role=='event_curator':
+        if request.get('transcription_only'):
             assert request['images'][0]['url']==PNG and request['images'][0]['sha256']==sha
             assert request['images'][0]['source_message_id']==1
             assert PNG not in request['prompt']
+            return {'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]}
+        if role=='event_curator':
+            assert request['images']==[] and request['pretranscribed']
         if role=='event_writer':
             assert request['images']==[] and request['image_input_mode']=='transcriptions_only'
             assert request['curator_image_transcriptions']==[{'source_message_id':1,'position':1,'sha256':sha,
@@ -43,7 +46,7 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
             assert request['images'][0]['url']=='[frozen task image]'
             from serein.extensions.pipeline_images import hydrate_request_images
             request=hydrate_request_images(settings.database,request['batch_id'],request)
-        if request['role']=='event_curator':assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
+        if request.get('transcription_only'):assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
         if request['role']=='event_writer':
             assert isinstance(payload['messages'][1]['content'],str) and PNG not in payload['messages'][1]['content']
         result=check(request)
@@ -53,13 +56,13 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
     monkeypatch.setattr('serein.model_runtime.complete',complete)
     result=asyncio.run(p.advance(settings.database,include_recent=True))
     if mode=='agent':
-        for role in p.ROLES:
-            assert result['role']==role
+        for task in ['track_router','image_transcription','event_curator','event_writer']:
+            assert result['request']['execution']['task']==task
             output=check(result['request'])
             p.submit(settings.database,result['job_id'],output)
             result=asyncio.run(p.advance(settings.database,include_recent=True))
     assert result['events']==1 and result['processed_originals']==2
-    assert seen==list(p.ROLES)+(['event_writer'] if mode=='api' else [])
+    assert seen==['track_router','image_transcription','event_curator','event_writer']+(['event_writer'] if mode=='api' else [])
     with Store(settings.database,read_only=True) as store:
         details=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in details and details['curator_image_transcriptions'][0]['sha256']==sha
@@ -199,7 +202,10 @@ def test_completed_task_media_expires_after_seven_days_but_raw_archive_and_text_
     raw_archive(settings).ingest([
         {'source_event_id':'image','session_id':'one','role':'user','text':'The book title','created_at':'2025-01-01T00:00:00Z','metadata':{'attachments':[{'kind':'image','url':PNG}]}},
         {'source_event_id':'reply','session_id':'one','role':'assistant','text':'Agreed','created_at':'2025-01-01T00:01:00Z'}],source='synthetic')
-    async def runner(role,request):return output_for(role,request)
+    async def runner(role,request):
+        if request.get('transcription_only'):
+            return {'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]}
+        return output_for(role,request)
     asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
     with Store(settings.database) as store:
         store.conn.execute("UPDATE pipeline_batches SET result_json=json_set(result_json,'$.completed_at','2000-01-01T00:00:00Z') WHERE status='done'")

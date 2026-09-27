@@ -5,6 +5,7 @@ These checks verify references and exact quotes, not the truth of a paraphrase.
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 
@@ -33,6 +34,36 @@ def canonicalize_claim_group_ids(result: dict) -> None:
         group['claim_group_id'] = mapping[value]
     for row in sentences:
         row['claim_group_ids'] = [mapping[value.strip()] for value in row['claim_group_ids']]
+
+
+def closest_verbatim_boundary_quote(content: str, quote: str) -> str | None:
+    """Recover a nearby exact sentence when the Curator paraphrases its citation."""
+    if quote in content:
+        return quote
+    compact_quote = re.sub(r"[\s`*_>#\[\](){}]+", "", quote)
+    if len(compact_quote) < 4:
+        return None
+    candidates = [
+        match.group(0).strip()
+        for match in re.finditer(r"[^。！？!?\n]+[。！？!?]*", content)
+        if match.group(0).strip()
+    ]
+    ranked: list[tuple[int, float, int, str]] = []
+    for index, candidate in enumerate(candidates):
+        compact_candidate = re.sub(r"[\s`*_>#\[\](){}]+", "", candidate)
+        if not compact_candidate:
+            continue
+        matcher = SequenceMatcher(None, compact_quote, compact_candidate)
+        longest = matcher.find_longest_match().size
+        ranked.append((longest, matcher.ratio(), -index, candidate))
+    if not ranked:
+        return None
+    longest, ratio, _position, candidate = max(ranked)
+    minimum_overlap = min(6, max(4, len(compact_quote) // 4))
+    if longest < minimum_overlap or ratio < 0.18:
+        return None
+    return candidate
+
 
 
 def _source_span(span: Any, sources: dict[int, dict] | None, label: str, errors: list[str]) -> tuple[int, str] | None:
@@ -287,6 +318,16 @@ def curator_receipt_errors(review: Any, plan: dict, component: dict) -> list[str
             errors.append('decision_review.boundaries 缺少双方证据')
             continue
         for span in row['evidence']:
+            if isinstance(span, dict) and set(span) == {'source_message_id', 'quote'}:
+                source_id, quote = span['source_message_id'], span['quote']
+                if (type(source_id) is int and source_id in messages and isinstance(quote, str)
+                        and quote.strip() and sum(source_id in ids for ids in owners) == 1):
+                    content = str(messages[source_id].get('content') or '')
+                    materials = [content, *[str(text or '') for text in messages[source_id].get('evidence_texts') or []]]
+                    if not any(quote in text for text in materials):
+                        repaired = closest_verbatim_boundary_quote(content, quote)
+                        if repaired is not None:
+                            span['quote'] = repaired
             valid = _source_span(span, messages, 'boundary', errors)
             if valid:
                 sides = [side for side, ids in enumerate(owners) if valid[0] in ids]

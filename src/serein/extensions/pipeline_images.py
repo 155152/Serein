@@ -18,6 +18,10 @@ MAX_IMAGE_REDIRECTS = 3
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20
 
 
+class MissingOriginalImage(ValueError):
+    """The attachment is gone, rather than a temporary download failure."""
+
+
 def _public_image_target(url):
     try:
         parsed = urlsplit(url)
@@ -67,6 +71,8 @@ def _remote_image_bytes(url):
                     if len(body) > MAX_IMAGE_BYTES:
                         raise ValueError('图片超过 10 MB')
                 return bytes(body)
+            if response.status in (404, 410):
+                raise MissingOriginalImage(f'原图已不存在（HTTP {response.status}）')
             if response.status not in (301, 302, 303, 307, 308):
                 raise ValueError(f'读取原图失败（HTTP {response.status}）')
             if redirect_count >= MAX_IMAGE_REDIRECTS:
@@ -120,7 +126,7 @@ def freeze_images(images, previous=()):
     return result
 
 
-def freeze_task_images(database,batch_id,images,previous=()):
+def freeze_task_images(database,batch_id,images,previous=(),*,missing=None):
     """Freeze canonical bytes once outside JSON, then hydrate only live requests."""
     previous_by_key={(item['source_message_id'],item['position']):item for item in previous}
     with Store(database,read_only=True) as store:
@@ -132,7 +138,13 @@ def freeze_task_images(database,batch_id,images,previous=()):
         if row:
             body=row['body'];mime=row['mime_type'];sha=row['sha256']
         else:
-            body,mime=image_bytes(image['url']);sha=hashlib.sha256(body).hexdigest()
+            try:
+                body,mime=image_bytes(image['url'])
+            except MissingOriginalImage:
+                if missing is None:raise
+                missing.append({'source_message_id':key[0],'position':key[1],'reason':'original_missing'})
+                continue
+            sha=hashlib.sha256(body).hexdigest()
             new.append((batch_id,key[0],key[1],sha,mime,body))
         if old and old.get('sha256')!=sha:
             raise ValueError('冻结图片摘要不匹配，请重新领取任务')
