@@ -58,9 +58,11 @@ test('observation distinguishes disabled recall, preparation, failure and succes
   assert.equal(resolveGatewayObservationOutcome({...prepared,request_status:'failed'},'injected'),'failed');
   assert.equal(resolveGatewayObservationOutcome({...prepared,request_status:'interrupted'},'injected'),'failed');
   assert.equal(resolveGatewayObservationOutcome({...prepared,request_status:'completed',recall_state:'disabled'},'no_match'),'skip');
-  assert.equal(gatewayRequestLabel({...prepared,request_status:'completed',recall_state:'disabled'}),'');
+  assert.match(gatewayRequestLabel({...prepared,request_status:'completed',recall_state:'disabled'}),/已关闭.*未注入/);
   assert.equal(resolveGatewayObservationOutcome({...prepared,request_status:'completed',recall_state:'no_match'},'skip'),'no_match');
   assert.equal(resolveGatewayObservationOutcome({...prepared,request_status:'completed',injected_bucket_ids:['scene:a']},'skip'),'injected');
+  assert.match(gatewayRequestLabel({...prepared,request_status:'completed',injected_bucket_ids:['scene:a']}),/注入 1 条记忆.*已完成/);
+  assert.match(gatewayRequestLabel({...prepared,request_status:'completed',recall_state:'no_match'}),/没有选出/);
   assert.equal(resolveGatewayObservationOutcome({},'injected'),'injected');
   assert.equal(gatewayRequestLabel({}),'历史记录');
   assert.equal(resolveBridgeObservationOutcome({hookOutcome:'no_match'}),'no_match');
