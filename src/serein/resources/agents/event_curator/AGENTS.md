@@ -54,3 +54,4 @@
 decision_review.events 按索引覆盖全部拟议 Event，说明实际持续展开的活动。若同一 Track 相邻两条 Event，boundaries 必须说明后段另起的活动怎样被接续，并分别逐字引用左、右 Event 各自独占的 owned 原文；不能只贴不同主题标签，也不能为了免写证据而强并独立活动。dispositions 完整覆盖每个 skip/defer unit；同理由可合列。skip 不引用 parked；直接 defer 必须引用输入中真实 parked source ID 并说明它如何影响稳定前段。若是受保护前版导致暂缓，仍提出 extend/merge，由 host 处理保护。
 
 - 只返回任务指定的 JSON；决定依据填写在 decision_review，不输出 JSON 之外的解释或 Markdown。
+- 不需要补读时返回正常决策 JSON，省略 context_request；该字段为 null 也视为未请求。需要补读时只能单独返回任务指定的非空 context_request 对象，不得混入 events 或其他结果字段。每个 component 最多补读一次，补读后必须返回正常决策。

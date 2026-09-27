@@ -47,3 +47,5 @@ recallable 只判断是否允许普通自动召回：技术闲聊一律 false；
 previous_events_json 是本次 extend/merge 要替换的前版正文。重读完整 owned 原文，保留前后各阶段的重要内容，不能只用最新一段覆盖旧经历；旧正文仅用来核对遗漏，不能代替证据。
 
 只返回 JSON。
+
+不需要补读时返回正常 Writer JSON，省略 context_request；该字段为 null 也视为未请求。若任务允许补读且缺少对象、真实起因或被纠正旧主张，只能单独返回任务指定的非空 context_request 对象，不得混入正文或其他结果字段。每个 component 最多补读一次，补读后必须返回正常 Writer 结果。

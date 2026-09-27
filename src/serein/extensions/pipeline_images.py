@@ -215,7 +215,8 @@ def bind_transcriptions(output, images):
 
 
 def decision(output):
-    return {key: value for key, value in output.items() if key != 'image_transcriptions'}
+    return {key: value for key, value in output.items()
+            if key != 'image_transcriptions' and not (key == 'context_request' and value is None)}
 
 
 def verify_transcriptions(transcriptions, images):

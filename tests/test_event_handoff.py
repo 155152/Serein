@@ -12,6 +12,77 @@ PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
 
 
 @pytest.mark.parametrize('mode',['agent','api'])
+def test_null_context_requests_save_and_resume_without_rereading(settings,monkeypatch,mode):
+    ingest(settings);seen=[]
+    def no_reread(*args):raise AssertionError('null must not trigger a context read')
+    monkeypatch.setattr(p,'extend_context',no_reread)
+    def result_for(request):
+        role=request['role'];seen.append(role)
+        result=output_for(role,request)
+        if role in ('event_curator','event_writer'):
+            assert 'context_request: null' in request['prompt']
+            assert 'context_request' in request['rules']
+            result['context_request']=None
+            p.validate({**request,'context_read':True},result)
+            with pytest.raises(ValueError):p.validate(request,{'context_request':None})
+        return result
+    if mode=='api':
+        save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
+            'assignments':{role:'local' for role in p.ROLES},'pipeline':{'execution_mode':'api'}})
+        async def complete(model,payload):
+            with Store(settings.database,read_only=True) as store:
+                request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+            return {'choices':[{'message':{'content':json.dumps(result_for(request))}}]}
+        monkeypatch.setattr('serein.model_runtime.complete',complete)
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    if mode=='agent':
+        while result['status']=='awaiting_agent':
+            p.submit(settings.database,result['job_id'],result_for(result['request']))
+            result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert result['events']==1 and result['processed_originals']==2
+    assert seen==list(p.ROLES)
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM pipeline_attempts WHERE error!=?',('',)).fetchone()[0]==0
+
+
+@pytest.mark.parametrize('role',['event_curator','event_writer'])
+def test_nonnull_context_requests_keep_scope_shape_and_single_read_limits(settings,role):
+    ingest(settings)
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    p.submit(settings.database,task['job_id'],output_for(task['role'],task['request']))
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    request={**task['request'],'role':role};component=request['component']
+    query={'track_id':component['track_ids'][0],'before_message_id':min(m['id'] for m in component['messages']),'reason':'missing_subject'}
+    p.validate(request,{'context_request':query})
+    invalid=[{},[],False,'request',0,{**query,'track_id':'foreign'},
+             {**query,'before_message_id':-1},{**query,'reason':'more_context'},{**query,'extra':True}]
+    for value in invalid:
+        with pytest.raises(ValueError):p.validate(request,{'context_request':value})
+    with pytest.raises(ValueError):p.validate(request,{'context_request':query,'events':[]})
+    with pytest.raises(ValueError):p.validate({**request,'context_read':True},{'context_request':query})
+
+
+@pytest.mark.parametrize('role',['event_curator','event_writer'])
+def test_null_final_result_after_one_context_read(settings,monkeypatch,role):
+    ingest(settings);reads=[];original=p.extend_context
+    def reread(database,component,query):
+        reads.append(query)
+        return original(database,component,query)
+    monkeypatch.setattr(p,'extend_context',reread)
+    async def runner(stage,request):
+        if stage==role and not request.get('context_read'):
+            return {'context_request':{'track_id':request['component']['track_ids'][0],
+                'before_message_id':min(m['id'] for m in request['component']['messages']),'reason':'missing_subject'}}
+        result=output_for(stage,request)
+        if stage==role:
+            assert request['context_read'] and '不得再次返回非空 context_request' in request['prompt']
+            result['context_request']=None
+        return result
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))['events']==1
+    assert len(reads)==1
+
+
+@pytest.mark.parametrize('mode',['agent','api'])
 def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(settings,monkeypatch,mode):
     import base64
     import hashlib

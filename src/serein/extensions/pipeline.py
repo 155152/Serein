@@ -704,6 +704,10 @@ def request_for(database,batch,role,**fields):
             request['rules']=PROMPT
             prompt=PROMPT+'\n只提供图片材料，不切分事件、不决定归属。'
         prompt=re.sub(r'data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+','[原图见图像输入]',prompt)
+        if role in ('event_curator','event_writer') and not request.get('transcription_only'):
+            prompt+='\n不需要补读时返回正常任务 JSON，省略 context_request；context_request: null 也视为未请求。非空 context_request 必须单独返回，不得混入正常结果字段。'
+            if request.get('context_read'):
+                prompt+='\n本 component 已补读一次，不得再次返回非空 context_request；请根据现有材料返回正常任务 JSON。'
         request['prompt']=prompt
     return request
 
@@ -715,7 +719,7 @@ def validate(request,output):
     if request.get('transcription_only'):
         if set(output)!={'image_transcriptions'}:raise ValueError('补读图片只允许返回转录，不改变 Event 归属')
         bind_transcriptions(output,request.get('images',[]));return
-    if role in ('event_curator','event_writer') and 'context_request' in output:
+    if role in ('event_curator','event_writer') and output.get('context_request') is not None:
         c=output['context_request'];component=request['component']
         if request.get('context_read') or set(output)!={'context_request'} or not isinstance(c,dict) or set(c)!={'track_id','before_message_id','reason'} or c.get('track_id') not in component['track_ids'] or c.get('before_message_id')!=min(m['id'] for m in component['messages']) or c.get('reason') not in ('missing_subject','missing_origin','missing_prior_claim'):
             raise ValueError('Only one bounded component context request is allowed')
@@ -725,16 +729,11 @@ def validate(request,output):
             assignments,_,_=normalize_event_track_message_output(output,request['messages'],request['active_tracks'],session_id='validate',next_track_ordinal=1)
             routing_units(request['messages'],assignments)
         elif role=='event_curator':
-            if 'context_request' in output:
-                c=output['context_request'];component=request['component']
-                if request.get('context_read') or set(output)!={'context_request'} or not isinstance(c,dict) or c.get('track_id') not in component['track_ids'] or c.get('before_message_id')!=min(m['id'] for m in component['messages']) or c.get('reason') not in ('missing_subject','missing_origin','missing_prior_claim'):
-                    raise ValueError('Only one bounded component context request is allowed')
-            else:
-                bound=bind_transcriptions(output,request.get('images',[]))
-                component={**request['component']}
-                if bound:
-                    component['curator_image_transcriptions']=bound
-                latest.normalize_event_curator_output(decision(output),component)
+            bound=bind_transcriptions(output,request.get('images',[]))
+            component={**request['component']}
+            if bound:
+                component['curator_image_transcriptions']=bound
+            latest.normalize_event_curator_output(decision(output),component)
         else:
             transcriptions:dict[int,list[str]]={}
             for item in request.get('curator_image_transcriptions') or []:
@@ -1191,7 +1190,7 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
             with Store(database) as store:store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encoded_data,batch['id']))
             output=await job(database,batch,request,f'event_curator:{index}',runner)
             component=request['component']
-            if 'context_request' in output:
+            if output.get('context_request') is not None:
                 component=extend_context(database,component,output['context_request'])
                 pretranscribed=await transcribe_component(database,batch,component,f'{index}:context',runner)
                 request=request_for(database,batch,'event_curator',component=component,context_read=True,pretranscribed=pretranscribed)
@@ -1212,7 +1211,7 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
             # Any bounded context read remains serial: it can create shared image
             # transcription work and must not race another Writer's repair path.
             for ordinal,(event,written,request,owned) in enumerate(first_results):
-                if 'context_request' in written:
+                if written.get('context_request') is not None:
                     reading=extend_context(database,component,written['context_request'])
                     used_separate=await transcribe_component(database,batch,reading,f'{index}:{ordinal}',runner,key_prefix='writer_context_images')
                     if reading.get('unavailable_images'):
