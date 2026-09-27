@@ -363,6 +363,7 @@ export async function readLiveWindowShadows() {
       title,
       summary: summary.length <= 96 ? summary : `${summary.slice(0, 95)}…`,
       text,
+      sections: item?.sections ?? {},
       scenes: Array.isArray(item?.scenes) ? item.scenes : [],
       sourceLabel: "Serein",
       statusLabel: "已入库窗影",
