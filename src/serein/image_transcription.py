@@ -136,7 +136,7 @@ async def _transcribe_one(model, image, timeout_seconds):
     response = await complete(
         {**model, "request_timeout_seconds": timeout_seconds},
         {"messages": [{"role": "user", "content": content}],
-         "response_format": {"type": "json_object"}},
+         "response_format": {"type": "json_object"}, "temperature": 0},
     )
     try:
         choice = response['choices'][0]
