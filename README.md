@@ -1,5 +1,9 @@
 # Serein
 
+<a href="https://github.com/DasterProkio/awesome-ai-companion/blob/main/README.zh-CN.md">
+  <img src="https://raw.githubusercontent.com/DasterProkio/awesome-ai-companion/main/assets/featured-in-awesome-ai-companion-zh-CN.png" alt="已收录于人机恋开源项目大全" height="24">
+</a>
+
 让聊天里值得留下的东西，有地方保存，也有机会在下一次被想起。
 
 Serein 是一个可自行部署、面向个人使用的 AI 记忆服务。它提供网页、聊天 API 网关和 MCP 工具，让不同聊天窗口读写同一份记忆。公开版从空库开始，不附带私人记忆或模型密钥。
