@@ -11,7 +11,8 @@ export function PipelineSettings({onOpenSummary}) {
   const running=['queued','running'].includes(work?.status);
   const needsRepair=work?.status==='needs_repair'||work?.result?.status==='needs_repair';
   const failure=work?.error||(needsRepair?work?.result?.reason:'');
-  const stages={idle:'尚未开始',queued:'等待后台处理',starting:'正在准备',track_router:'归线',event_curator:'切分整理',event_writer:'Event 写作',awaiting_agent:'等待 Agent',processed:'已保存',current:'整理完成',needs_repair:'归线材料待修复',rebuilt:'计划已重建'};
+  const candidateOverflows=work?.result?.candidate_overflow_deferrals||[];
+  const stages={paused:'本批已暂停',idle:'尚未开始',queued:'等待后台处理',starting:'正在准备',track_router:'归线',event_curator:'切分整理',event_writer:'Event 写作',awaiting_agent:'等待 Agent',processed:'已保存',current:'整理完成',needs_repair:'归线材料待修复',rebuilt:'计划已重建'};
   async function call(action,body) {
     const response=await fetch('/__serein/pipeline/'+action,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const result=await response.json();
@@ -43,6 +44,27 @@ export function PipelineSettings({onOpenSummary}) {
   function beginRebuild() {
     setRebuildTarget(work?.result?.batch_id||work?.batch_id||'');
     rebuildDialog.current.showModal();
+  }
+  async function retryBatch(batchId) {
+    if(busy||running)return;
+    setBusy(true);
+    try {
+      const result=await call('retry-batch',{batch_id:batchId});
+      if(result.status==='busy')throw new Error('整理任务正在运行，请稍后重试。');
+      accept(await call('next',{include_recent:true}));
+      setStatus('已恢复批次，从失败步骤继续，成功结果保留。');
+    }catch(error){setStatus(error.message);}finally{setBusy(false);}
+  }
+  async function retryImage(sha256) {
+    if(busy||running)return;
+    setBusy(true);
+    try {
+      const result=await call('retry-image',{sha256});
+      if(result.status==='busy')throw new Error('整理任务正在运行，请稍后重试。');
+      accept(await call('status'));
+      accept(await call('next',{include_recent:true}));
+      setStatus('已重新开放这张图片的三次转录机会，正在继续整理。');
+    }catch(error){setStatus(error.message);}finally{setBusy(false);}
   }
   async function confirmRebuild() {
     if(busy||!rebuildTarget)return;
@@ -83,7 +105,13 @@ export function PipelineSettings({onOpenSummary}) {
       {work.result?.note&&<p>{work.result.note}</p>}
       {work.result?.pending>0&&<p>本批仍有 {work.result.pending} 条原话等待后续处理。</p>}
       {work.result?.deferred>0&&<p>暂缓 {work.result.deferred} 条原话；其中 {work.result.protected_deferrals?.length||0} 条事件提案涉及已有内容保护。可对照原话与已有事件人工处理。</p>}
+      {candidateOverflows.map(item=><p key={item.track_id} className="import-error">Track <code>{item.track_id}</code> 有 {item.eligible_active_leaf_count} 条 active Event leaves，超过上限 {item.limit}；本批未调用 Curator 或 Writer。请先归档误归线或不再需要的 Event，或人工安全合并相关 leaves。</p>)}
       {work.result?.skipped>0&&<p>本批跳过 {work.result.skipped} 条原话，原始记录仍保留。</p>}
+      {work.result?.missing_images?.length>0&&<p>已跳过 {work.result.missing_images.length} 个缺失的图片附件；原话文字保留，未猜补图片内容。</p>}
+      {(work.failed_images||[]).map(image=><p className="import-error" key={image.sha256}>
+        图片 {image.sha256.slice(0,8)} 转录失败三次，已暂停自动重试；依赖它的原话仍保留。
+        <button type="button" disabled={busy||running} onClick={()=>retryImage(image.sha256)}>重试这张图片</button></p>)}
+      {(work.paused_batches||[]).map(batch=><p className="import-error" key={batch.batch_id}>本批累计失败三次，已暂停：{batch.reason}。同一聊天的后续整理等待它恢复，其他聊天可继续。<button type="button" disabled={busy||running} onClick={()=>retryBatch(batch.batch_id)}>重试此批次</button></p>)}
       {failure&&<p className="import-error">{needsRepair?'待修复原因':'失败原因'}：{failure}</p>}
       {needsRepair&&<p>批次：<code>{work.result?.batch_id||work.batch_id}</code>。原话与已完成步骤保留。先重新校验以恢复历史归线；无法恢复时，可明确作废本批计划并重新归线。不会跳过原话或删除已保存的 Event。</p>}
       {task&&<p>等待 {stages[task.role]||task.role}：下载任务交给 Agent，再提交返回的 JSON。</p>}</div>}

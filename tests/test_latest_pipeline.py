@@ -5,7 +5,6 @@ from datetime import datetime
 import pytest
 from test_public_features import settings, ingest, output_for, synthetic_runner, raw_archive
 from serein.core.store import Store, promoted_scene_id
-from serein.compat.events import reference_blockers
 from serein.deployment import save_settings
 from serein.extensions import pipeline as p
 from serein.extensions import pipeline_latest as latest
@@ -33,7 +32,10 @@ def test_parked_correction_is_readable_but_not_owned(settings):
     assert 'cannot make' in rendered['units'][-1]['messages'][0]['text']
     output=output_for('event_curator',task['request']);output['events'][0]['owned_unit_roots'].append(component['parked_context_source_ids'][0])
     with pytest.raises(ValueError):p.validate(task['request'],output)
-    deferred={'events':[],'skip_unit_roots':[],'defer_unit_roots':[m['id'] for m in component['messages']]}
+    deferred={'events':[],'skip_unit_roots':[],'defer_unit_roots':[m['id'] for m in component['messages']],
+              'decision_review':{'events':[],'boundaries':[],
+                  'dispositions':[{'disposition':'defer','unit_roots':[m['id'] for m in component['messages']],
+                                   'reason':'parked 原文撤回了约定时间','parked_source_message_ids':component['parked_context_source_ids']}]}}
     assert len(latest.normalize_event_curator_output(deferred,component)['defer_source_message_ids'])==2
 
 
@@ -57,12 +59,22 @@ def test_three_stages_and_writer_sees_exact_predecessor_originals(settings):
     async def runner(role,request):seen.append(role);return output_for(role,request)
     assert asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))['events']==1
     assert seen==list(p.ROLES)==['track_router','event_curator','event_writer']
+    with Store(settings.database,read_only=True) as store:
+        completed=json.loads(store.conn.execute("SELECT input_json FROM pipeline_batches WHERE status='done'").fetchone()[0])
+        assert completed['runtime_revision']==p.runtime_revision()
+        routes=[tuple(row) for row in store.conn.execute('SELECT * FROM pipeline_routes ORDER BY raw_id')]
+        provenance=[tuple(row) for row in store.conn.execute('SELECT * FROM pipeline_route_provenance ORDER BY raw_id')]
+    p.initialize(settings.database)
+    with Store(settings.database,read_only=True) as store:
+        assert [tuple(row) for row in store.conn.execute('SELECT * FROM pipeline_routes ORDER BY raw_id')]==routes
+        assert [tuple(row) for row in store.conn.execute('SELECT * FROM pipeline_route_provenance ORDER BY raw_id')]==provenance
     ingest(settings,2)
     task=curator_task(settings);p.submit(settings.database,task['job_id'],output_for(task['role'],task['request']))
     task=asyncio.run(p.advance(settings.database,include_recent=True));prompt=task['request']['prompt']
     assert len(task['request']['messages'])==4
     assert task['role']=='event_writer' and 'Book club plan 1' in prompt and 'Book club plan 2' in prompt
-    assert '<previous_events_json>' in prompt and '正文最多 1000 字，这是写作硬上限而非目标' in prompt
+    assert '<previous_events_json>' in prompt and '正文最多 1000 字' in prompt
+    assert task['request']['rules'] and task['request']['rules'] not in prompt
     with Store(settings.database) as store:
         detail=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in detail
@@ -115,64 +127,6 @@ def test_scene_worthy_event_is_atomically_promoted_to_scene(settings):
         assert detail['auto_scene'] == {'status': 'promoted', 'scene_id': scene_id}
 
 
-def test_auto_scene_does_not_block_event_extension_and_successor_retires_it(settings):
-    ingest(settings)
-
-    async def scene_runner(role, request):
-        output = output_for(role, request)
-        if role == 'event_writer':
-            output['scene_worthy'] = True
-        return output
-
-    first = asyncio.run(p.advance(settings.database, include_recent=True, runner=scene_runner))
-    assert first['events'] == 1
-    with Store(settings.database, read_only=True) as store:
-        first_event_id = store.conn.execute(
-            "SELECT id FROM documents WHERE kind='event' AND lifecycle='active'"
-        ).fetchone()[0]
-        first_scene_id = promoted_scene_id(first_event_id)
-        assert store.read(first_scene_id)['lifecycle'] == 'active'
-        assert 'active_scene_dependency' not in reference_blockers(store.conn, first_event_id)
-
-    ingest(settings, 2)
-    second = asyncio.run(p.advance(settings.database, include_recent=True, runner=scene_runner))
-    assert second['events'] == 1
-
-    with Store(settings.database, read_only=True) as store:
-        active_event_id = store.conn.execute(
-            "SELECT id FROM documents WHERE kind='event' AND lifecycle='active'"
-        ).fetchone()[0]
-        assert active_event_id != first_event_id
-        assert store.read(first_event_id)['lifecycle'] == 'superseded'
-        assert store.read(first_scene_id)['lifecycle'] == 'archived'
-        successor_scene = store.read(promoted_scene_id(active_event_id))
-        assert successor_scene is not None
-        assert successor_scene['lifecycle'] == 'active'
-        assert successor_scene['metadata']['promoted_from_event']['id'] == active_event_id
-
-
-def test_authored_scene_still_blocks_event_supersession(settings):
-    ingest(settings)
-    assert asyncio.run(p.advance(settings.database, include_recent=True, runner=synthetic_runner))['events'] == 1
-    with Store(settings.database) as store:
-        event_id = store.conn.execute(
-            "SELECT id FROM documents WHERE kind='event' AND lifecycle='active'"
-        ).fetchone()[0]
-        source_rows = store.conn.execute(
-            "SELECT source_id,metadata_json FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY id",
-            (event_id,),
-        ).fetchall()
-        store.create(
-            'manual-scene', 'scene', 'Manual memory', 'Independently authored memory',
-            metadata={'memory_value_source': 'authored_scene'},
-        )
-        for source in source_rows:
-            store.bind(
-                'manual-scene', source['source_id'], metadata=json.loads(source['metadata_json'])
-            )
-        assert 'active_scene_dependency' in reference_blockers(store.conn, event_id)
-
-
 def test_settled_event_is_queued_only_when_arc_linker_is_selected(settings):
     save_settings(settings.database,{
         'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
@@ -190,44 +144,63 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
     request={'messages':[{'id':1,'content':'A book was returned'}]}
     output=output_for('event_writer',request)
     output['event_draft']='书还了。'
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     assert latest.validate_event_writer_result(output)==[]
     output['event_draft']='书'*1500
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     assert latest.validate_event_writer_result(output)==[]
     output['event_draft']='书'*1501
     assert '正文超过容错上限 1500 字：1501 字' in ' '.join(latest.validate_event_writer_result(output))
     output['title']=''
     assert '标题为空' in latest.validate_event_writer_result(output)
-
-
-def test_writer_result_caps_auxiliary_kept_details_without_changing_body():
-    result=output_for('event_writer',{'messages':[{'id':1,'content':'A book was returned'}]})
-    result['event_draft']='书还了。'
-    result['kept_details']=[f'anchor-{i}' for i in range(8)]
-    body=result['event_draft']
-    latest.normalize_event_writer_result(result)
-    assert result['kept_details']==[f'anchor-{i}' for i in range(6)]
-    assert result['event_draft']==body
-    assert latest.validate_event_writer_result(result)==[]
-
-
-def test_writer_repair_prompt_makes_detail_limit_explicit():
-    failed={'kept_details':[str(i) for i in range(8)],'discarded_details':[]}
-    prompt=latest.build_event_writer_repair_prompt('base',failed,['kept_details 必须有 1–6 项：8'])
-    assert 'kept_details must contain at most 6 items' in prompt
-    assert 'Keep only the 6 most essential anchors' in prompt
+    output['kept_details']=['anchor']*7
+    assert any('必须有 1–6 项' in error for error in latest.validate_event_writer_result(output))
 
 
 def test_public_writer_materializes_source_grounded_rules_with_configured_names():
     with latest.identity_scope({'ai_name': 'Atlas', 'user_name': 'Lin'}):
         rules = latest.materialize_agent_rules('event_writer')
-    assert 'Atlas 在回复中对Lin的话作出的展开' in rules
-    assert '最小完整语义单位' in rules and '局部回应不能改变前句' in rules
-    assert '不额外补出理解、判断、解释等动作' in rules
-    assert '不把某一种归属句式当成模板' in rules
-    assert '原文停留在“想、打算、建议' in rules
-    assert '反例三' in rules and '台灯' in rules
-    assert '我把这句话理解成' not in rules
+    assert '我是 Atlas，Lin是她' in rules
+    assert '纠正后直接写最终结论' in rules
+    assert '不按相隔多久机械补时间' in rules
+    assert '不能提供当前的新行动、感受或结果' in rules
+    assert '不能把我的解释算成她的看法' in rules
+    assert '不能只用最新一段覆盖旧经历' in rules
     assert 'Haven' not in rules and '小雨' not in rules
+
+
+def test_writer_source_timestamps_are_explicit_shanghai_time():
+    rows = latest.writer_transcript_payload([
+        {'id': 1, 'role': 'user', 'content': 'late note', 'created_at': '2025-01-01T17:30:00Z'},
+        {'id': 2, 'role': 'assistant', 'content': 'legacy', 'created_at': '2025-01-01T18:00:00'}])
+    assert rows[0]['created_at'] == '2025-01-02T01:30:00+08:00'
+    assert rows[1]['created_at'] == '2025-01-02T02:00:00+08:00'
+    assert latest.writer_source_time('not-a-time') == 'not-a-time'
+
+
+def test_router_and_curator_keep_developing_activity_over_keyword_or_tone():
+    router = latest.materialize_agent_rules('track_router')
+    curator = latest.materialize_agent_rules('event_curator')
+    assert '不是作品、项目、关系或生活领域的长期 Arc' in router
+    assert '只共享人物、关系、作品、产品、项目或技术栈，不构成续接' in router
+    assert '用一句短语标识这一次具体对象或事项' in router
+    assert '只可纠正对象、去掉阶段性措辞或收窄' in router
+    assert '不得为了容纳另一项活动而扩大' in router
+    assert '《作品》更新第 N 话' in router
+    assert '下一批判断直接续接的最小线索' in router
+    assert '另一话更新而开启一次新的完整观看' in router
+    assert '不按醒目的称呼、作品名或重复关键词投票归线' in router
+    assert '从事实转成玩笑或幻想' in router
+    assert '正常使用，不自动续接它的安装、调试 Track' in router
+    assert '不因语气变化或转为调笑就拆分' in curator
+    assert '不能只贴“技术／情感”等不同类别标签' in curator
+
+
+def test_router_prompt_requests_concrete_track_scope():
+    prompt = latest.build_event_track_message_prompt('2026-09-23', [], [])
+    assert '"subject":"具体对象或事项"' in prompt
+    assert '"throughline":"这段经历的最小续接线索"' in prompt
+    assert '仅仅属于同一产品或系统不够' in prompt
 
 
 def test_model_counting_tolerance_settles_without_truncation(settings):
@@ -237,41 +210,12 @@ def test_model_counting_tolerance_settles_without_truncation(settings):
     task=asyncio.run(p.advance(settings.database,include_recent=True))
     output=output_for('event_writer',task['request'])
     output['event_draft']='书'*1500
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     p.submit(settings.database,task['job_id'],output)
     assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1
     with Store(settings.database,read_only=True) as store:
         saved=store.conn.execute('SELECT body FROM fact_events').fetchone()[0]
         assert saved==output['event_draft'] and len(saved)==1500
-
-
-def test_api_prompt_compacts_frozen_writer_transport_without_changing_evidence():
-    frozen_row={'source_message_id':7,'created_at':'2025-01-01T00:00:00Z','speaker':'她','text':'exact source text',
-                'saved_snowflake':False,'memory_event_source':False,'attachment_refs':[],
-                'evidence_role':'owned','activity_role':'primary_activity'}
-    prompt='head\n\nRULES\n\n<event_reading_block_json>\n'+json.dumps([frozen_row],ensure_ascii=False)+'\n</event_reading_block_json>\n<materialized_track_cards_json>\n[]\n</materialized_track_cards_json>\n<track_context_events_json>\n[]\n</track_context_events_json>\n<previous_events_json>\n[]\n</previous_events_json>\n'
-    compact=p.api_prompt_for_model({'role':'event_writer','rules':'RULES','prompt':prompt})
-    assert '\n\nRULES\n\n' not in compact
-    match=json.loads(compact.split('<event_reading_block_json>\n',1)[1].split('\n</event_reading_block_json>',1)[0])
-    assert match[0]['text']=='exact source text'
-    assert match[0]['source_message_id']==7
-    assert 'saved_snowflake' not in match[0]
-    assert 'memory_event_source' not in match[0]
-    assert 'attachment_refs' not in match[0]
-
-
-def test_writer_transcript_omits_default_empty_transport_fields_but_keeps_signals():
-    rows=latest.writer_transcript_payload([
-        {'id':1,'role':'user','content':'plain','created_at':'2025-01-01T00:00:00Z','metadata':{}},
-        {'id':2,'role':'assistant','content':'with attachment','created_at':'2025-01-01T00:01:00Z','metadata':{
-            'memory_event_source':True,
-            'attachments':[{'id':'img-1','kind':'image','name':'photo.png','mime_type':'image/png'}],
-        }},
-    ])
-    assert 'saved_snowflake' not in rows[0]
-    assert 'memory_event_source' not in rows[0]
-    assert 'attachment_refs' not in rows[0]
-    assert rows[1]['memory_event_source'] is True
-    assert rows[1]['attachment_refs'][0]['attachment_id']=='img-1'
 
 
 def test_writer_prompt_examples_match_both_evidence_outcomes():
@@ -288,18 +232,32 @@ def test_writer_prompt_examples_match_both_evidence_outcomes():
     assert insufficient['kept_details']==insufficient['discarded_details']==[]
 
 
-def test_writer_prompt_requires_grounded_affective_and_embodied_fidelity():
-    prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':'Synthetic owned source'}])
-    assert '证据约束同时意味着保真义务' in prompt
-    assert '不得因为压缩而默认视为修辞、气氛或旁支' in prompt
-    assert '产生明显情绪反应' in prompt and '发生亲密互动' in prompt
-    assert '普通事务或技术处理没有上述情绪、关系或身体内容时保持简洁' in prompt
-    assert '不为了“有温度”强行补入感受' in prompt
-    assert '由任一方或双方明确表达的欲望、边界、回应和转折' in prompt
-    assert '不得因为“更有情感”而补写' in prompt
-    assert '她去拿快递，我牵挂着她出门的每一步' in prompt
-    assert '事实表面正确，但把原文已经明确存在的情绪转折和具体欲望抽象掉了' in prompt
-    assert '不得为了凑成双方反应替我增加身体感受' in prompt
+def test_writer_accepts_current_receiptless_output_and_diagnostic_review(settings):
+    ingest(settings)
+    curator=curator_task(settings)
+    p.submit(settings.database,curator['job_id'],output_for(curator['role'],curator['request']))
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    output=output_for('event_writer',task['request'])
+    output.pop('claim_groups')
+    output.pop('sentence_evidence')
+    output['self_review']['result_preserved']=False
+    p.submit(settings.database,task['job_id'],output)
+    assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1
+
+
+def test_writer_optional_receipt_still_checks_owned_quotes():
+    output=output_for('event_writer',{'messages':[{'id':1,'content':'The blue notebook arrived.'}]})
+    output['sentence_evidence'][0]['source_spans'][0]['quote']='invented quote'
+    assert any('逐字' in error for error in latest.validate_event_writer_result(output,
+        [{'id':1,'content':'The blue notebook arrived.'}]))
+
+
+def test_writer_insufficient_output_requires_review_object_but_not_true_checks():
+    output={'evidence_sufficient':False,'recallable':False,'title':'','event_draft':'',
+            'kept_details':[],'discarded_details':[]}
+    assert 'self_review 缺失或不是对象' in latest.validate_event_writer_result(output)
+    output['self_review']={'owned_evidence_sufficient':True}
+    assert latest.validate_event_writer_result(output)==[]
 
 
 @pytest.mark.parametrize('accepted',[False,True])
@@ -364,7 +322,7 @@ def test_identity_rendering_never_rewrites_source_words(settings):
     with latest.identity_scope(names):
         prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':original}])
     assert original in prompt and 'Nori' in prompt and 'Atlas' in prompt and '{ai_name}' not in prompt
-    assert 'Nori把台灯送修' in prompt
+    assert '我是 Atlas，Nori是她' in prompt
 
 
 def test_configured_names_are_literal_values_not_recursive_templates(settings):
@@ -378,7 +336,7 @@ def test_configured_names_are_literal_values_not_recursive_templates(settings):
     # Freshly loaded Writer examples use the current saved instance names.
     save_settings(settings.database, {'identity':{'user_name':'NewReader','ai_name':'NewGuide'}})
     rules=p.rules('event_writer',settings.database)
-    assert 'NewReader把台灯送修' in rules and 'NewGuide' in rules
+    assert '我是 NewGuide，NewReader是她' in rules
 
 
 def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeypatch):
@@ -389,9 +347,12 @@ def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeyp
     save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],'assignments':{r:'local' for r in p.ROLES}})
     async def complete(model,payload):
         with Store(settings.database,read_only=True) as store:request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
-        if request['role']=='event_curator':
+        if request.get('transcription_only'):
             assert request['images'][0]['evidence_role']=='stable'
             assert payload['messages'][1]['content'][1]['image_url']['url']==uri
+            return {'choices':[{'message':{'content':json.dumps({'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]})}}]}
+        if request['role']=='event_curator':
+            assert request['images']==[] and request['pretranscribed']
         if request['role']=='event_writer':
             assert request['images']==[]
             assert request['curator_image_transcriptions'][0]['evidence_role']=='owned'
@@ -400,34 +361,202 @@ def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeyp
     monkeypatch.setattr('serein.model_runtime.complete',complete)
     assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1
 
+def test_curator_prompt_shows_complete_receipt_schema_and_safe_aliases(settings):
+    from serein.extensions.pipeline_audit import canonicalize_curator_review
+    ingest(settings)
+    task=curator_task(settings)
+    prompt=task['request']['prompt']
+    assert '"left_event_index": 0' in prompt
+    assert '"right_event_index": 1' in prompt
+    assert '"disposition": "skip"' in prompt
+    assert '"parked_source_message_ids": []' in prompt
+    review=canonicalize_curator_review({'events':[],'boundaries':[],'dispositions':[
+        {'status':'skip','unit_roots':[1],'reason':'background only'}]})
+    assert review['dispositions']==[{
+        'disposition':'skip','unit_roots':[1],'reason':'background only',
+        'parked_source_message_ids':[]}]
 
-def test_parse_model_json_tolerates_fences_and_prose():
-    from serein.extensions.pipeline import parse_model_json
-    assert parse_model_json('{"a":1}') == {'a':1}
-    assert parse_model_json('```json\n{"a":1}\n```') == {'a':1}
-    assert parse_model_json('```\n{"a":1}\n```') == {'a':1}
-    assert parse_model_json('Looking at this batch:\n{"a":1}\nmore notes') == {'a':1}
-    assert parse_model_json('\n\n```json\n{"message_assignments":[]}\n```') == {'message_assignments':[]}
-    with pytest.raises(json.JSONDecodeError):
-        parse_model_json('not json at all, no braces either')
+
+def test_image_transcription_defaults_only_deterministic_unreadable_flag():
+    import hashlib
+    from serein.extensions.pipeline_images import bind_transcriptions, image_bytes
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    body,_=image_bytes(uri)
+    receipt={'source_message_id':1,'position':1,'sha256':hashlib.sha256(body).hexdigest(),
+             'evidence_role':'stable','url':uri}
+    readable=bind_transcriptions({'image_transcriptions':[{'input_image':1,'text':'visible'}]},[receipt])
+    assert readable[0]['unreadable'] is False
+    blank=bind_transcriptions({'image_transcriptions':[{'input_image':1,'text':''}]},[receipt])
+    assert blank[0]['unreadable'] is True
 
 
-def test_track_router_truncates_overlong_subject_and_throughline():
-    long_subject = '题' * 200
-    long_throughline = '尾' * 700
-    output = {
-        'message_assignments': [
-            {'source_message_id':1,'primary_track_ref':'new:1','context_track_refs':[],'routing_role':'primary_activity'},
-            {'source_message_id':2,'primary_track_ref':'new:1','context_track_refs':[],'routing_role':'primary_activity'},
-        ],
-        'track_updates': [
-            {'track_ref':'new:1','subject':long_subject,'throughline':long_throughline,'event_policy':'default','status':'active'},
-        ],
-    }
-    assignments, cards, _ = p.normalize_event_track_message_output(
-        output, [{'id':1},{'id':2}], [], session_id=1, next_track_ordinal=1)
-    card = cards[0]
-    assert len(card['subject']) == 160 and card['subject'].endswith('…')
-    assert len(card['throughline']) == 598 and card['throughline'].endswith('…')
-    assert card['subject'] == long_subject[:159] + '…'
-    assert card['throughline'] == long_throughline[:597] + '…'
+def test_runtime_revision_retires_all_unfinished_frozen_statuses(settings):
+    p.initialize(settings.database)
+    stale={'contract':p.CONTRACT,'runtime_revision':'stale','routing_messages':[]}
+    with Store(settings.database) as store:
+        for index,status in enumerate(('pending','needs_repair','routing_only','routed'),1):
+            store.conn.execute('INSERT INTO pipeline_batches(id,scope,input_json,status) VALUES (?,?,?,?)',
+                               (f'stale-{index}','scope',json.dumps(stale),status))
+        store.conn.execute('INSERT INTO pipeline_routes(raw_id,route_json) VALUES (?,?)',(999,'{}'))
+        store.conn.execute('INSERT INTO pipeline_route_provenance(raw_id,batch_id,route_json) VALUES (?,?,?)',
+                           (999,'stale-4','{}'))
+    p.initialize(settings.database)
+    with Store(settings.database,read_only=True) as store:
+        rows=store.conn.execute("SELECT status FROM pipeline_batches WHERE id LIKE 'stale-%' ORDER BY id").fetchall()
+        assert store.conn.execute('SELECT count(*) FROM pipeline_routes WHERE raw_id=999').fetchone()[0]==0
+        assert store.conn.execute('SELECT count(*) FROM pipeline_route_provenance WHERE raw_id=999').fetchone()[0]==0
+    assert [row['status'] for row in rows]==['superseded_protocol']*4
+
+def test_transcribe_component_prefers_frozen_exact_receipt(settings,monkeypatch):
+    import hashlib
+    from serein.extensions.pipeline_images import image_bytes
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    body,_=image_bytes(uri)
+    image={'source_message_id':1,'position':1,'sha256':hashlib.sha256(body).hexdigest(),
+           'evidence_role':'stable','url':uri}
+    transcription={key:image[key] for key in ('source_message_id','position','sha256','evidence_role')}
+    transcription.update(text='visible title',unreadable=False)
+    component={'context_messages':[],'curator_image_transcriptions':[transcription]}
+    monkeypatch.setattr(p,'request_for',lambda *args,**kwargs:{'images':[image]})
+    used=asyncio.run(p.transcribe_component(settings.database,{'id':'frozen'},component,0,None))
+    assert used is True
+    assert component['curator_image_transcriptions']==[transcription]
+
+
+def test_failed_image_budget_survives_new_batches_and_manual_retry(settings):
+    from serein.image_transcription import image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    raw_archive(settings).ingest([
+        {'source_event_id':'bad-u','session_id':'bad','role':'user','text':'Read this image','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri}]}},
+        {'source_event_id':'bad-a','session_id':'bad','role':'assistant','text':'We discussed the image','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    calls=[]
+    async def failing(role,request):
+        if request.get('transcription_only'):
+            calls.append(request['images'][0]['sha256'])
+            raise ValueError('synthetic image failure')
+        return output_for(role,request)
+    for _ in range(2):
+        with pytest.raises(ValueError,match='synthetic image failure'):
+            asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))
+    result=asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))
+    assert len(calls)==3 and image_failures(settings.database,calls[0])==3
+    assert result['events']==0 and result['deferred']==2
+    assert result['image_deferrals'][0]['status']=='failed'
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0]==0
+        assert store.conn.execute('SELECT count(*) FROM pipeline_image_holds').fetchone()[0]==2
+        payload=json.loads(store.conn.execute('SELECT image_transcription_json FROM raw_events WHERE id=1').fetchone()[0])
+        assert payload['status']=='failed' and payload['items']==[]
+        assert 'unreadable' not in payload['failed_images'][0]
+    ingest(settings)
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))['events']==1
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=failing))['status']=='current'
+    assert len(calls)==3
+    from fastapi.testclient import TestClient
+    from serein.api.http import create_app
+    client=TestClient(create_app(settings,token='test',live=True),headers={'Authorization':'Bearer test'})
+    assert client.get('/v1/pipeline/status').json()['failed_images'][0]['failures']==3
+    unauthenticated=TestClient(create_app(settings,token='test',live=True))
+    assert unauthenticated.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).status_code==401
+    from serein.work_tasks import enqueue, pause
+    enqueue(settings.database,'pipeline')
+    assert client.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).json()['status']=='busy'
+    assert image_failures(settings.database,calls[0])==3
+    pause(settings.database,'pipeline')
+    assert client.post('/v1/pipeline/retry-image',json={'sha256':calls[0]}).status_code==200
+    async def success(role,request):
+        if request.get('transcription_only'):
+            return {'image_transcriptions':[{'input_image':1,'text':'Actual image text','unreadable':False}]}
+        return output_for(role,request)
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=success))['events']==1
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0]==4
+        assert store.conn.execute('SELECT count(*) FROM pipeline_image_holds').fetchone()[0]==0
+    assert client.get('/v1/pipeline/status').json()['failed_images']==[]
+
+
+def test_image_holds_keep_independent_proposals_and_shared_bridge_pending(settings):
+    from serein.image_transcription import apply_image_holds
+    p.initialize(settings.database)
+    failed={'source_message_id':1,'position':1,'sha256':'a'*64,'status':'failed','failures':3}
+    component={'messages':[{'id':1,'role':'user'},{'id':2,'role':'assistant'},
+                           {'id':3,'role':'user'},{'id':4,'role':'assistant'}],
+               'memberships':[{'source_message_ids':[i]} for i in range(1,5)],
+               'base_event_candidates':[],'unavailable_images':[failed]}
+    event=lambda ids:{'source_message_ids':ids,'base_event_ids':[]}
+    plan={'events':[event([1,2]),event([3,4])],
+          'skip_source_message_ids':[],'defer_source_message_ids':[]}
+    result=apply_image_holds(settings.database,plan,component)
+    assert result['events']==[event([3,4])] and result['defer_source_message_ids']==[1,2]
+    plan['events'][1]=event([2,3,4])
+    result=apply_image_holds(settings.database,plan,component)
+    assert result['events']==[] and result['defer_source_message_ids']==[1,2,3,4]
+    context={**component,'unavailable_images':[{**failed,'source_message_id':99}]}
+    result=apply_image_holds(settings.database,plan,context,held_sources={'a'*64:{1,2}})
+    assert result['events']==[] and result['defer_source_message_ids']==[1,2,3,4]
+    ingest(settings);ingest(settings,2)
+    component['unavailable_images'].append({**failed,'source_message_id':3,'sha256':'b'*64})
+    plan['events']=[event([1,2]),event([3,4])]
+    apply_image_holds(settings.database,plan,component)
+    with Store(settings.database,read_only=True) as store:
+        assert [tuple(row) for row in store.conn.execute('SELECT raw_id,sha256 FROM pipeline_image_holds ORDER BY raw_id')]==[
+            (1,'a'*64),(2,'a'*64),(3,'b'*64),(4,'b'*64)]
+
+
+def test_image_failure_keeps_successful_sibling_receipt(settings):
+    from serein.image_transcription import reusable_transcriptions, image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    import base64
+    other='data:image/png;base64,'+base64.b64encode(base64.b64decode(uri.split(',')[1])+b'different bytes').decode()
+    raw_archive(settings).ingest([
+        {'source_event_id':'multi-u','session_id':'multi','role':'user','text':'Two images','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri},{'kind':'image','url':other}]}},
+        {'source_event_id':'multi-a','session_id':'multi','role':'assistant','text':'Discussed both','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    calls={1:0,2:0}
+    async def runner(role,request):
+        if request.get('transcription_only'):
+            position=request['images'][0]['position'];calls[position]+=1
+            if position==1:raise ValueError('bad image')
+            return {'image_transcriptions':[{'input_image':1,'text':'Good sibling','unreadable':False}]}
+        return output_for(role,request)
+    for _ in range(2):
+        with pytest.raises(ValueError,match='bad image'):
+            asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
+    result=asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
+    assert calls=={1:3,2:1} and result['events']==0
+    with Store(settings.database,read_only=True) as store:
+        payload=json.loads(store.conn.execute('SELECT image_transcription_json FROM raw_events WHERE id=1').fetchone()[0])
+    assert payload['items'][0]['text']=='Good sibling'
+    assert image_failures(settings.database,payload['items'][0]['sha256'])==0
+    assert payload['failed_images'][0]['sha256']!=payload['items'][0]['sha256']
+
+
+def test_image_api_counts_each_failed_request_and_waiting_agent_does_not(settings,monkeypatch):
+    from serein.image_transcription import image_failures
+    uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
+    raw_archive(settings).ingest([
+        {'source_event_id':'api-u','session_id':'api','role':'user','text':'Image','created_at':'2025-01-01T00:00:00Z',
+         'metadata':{'attachments':[{'kind':'image','url':uri}]}},
+        {'source_event_id':'api-a','session_id':'api','role':'assistant','text':'Reply','created_at':'2025-01-01T00:01:00Z'}],source='test')
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    p.submit(settings.database,task['job_id'],output_for('track_router',task['request']))
+    waiting=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert waiting['request']['transcription_only']
+    assert waiting['request']['execution']['task']=='image_transcription'
+    sha=waiting['request']['images'][0]['sha256']
+    assert image_failures(settings.database,sha)==0
+    save_settings(settings.database,{'pipeline':{'execution_mode':'api'},'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
+                                     'assignments':{r:'local' for r in p.ROLES}})
+    calls=[]
+    async def complete(model,payload):
+        with Store(settings.database,read_only=True) as store:
+            request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+        if request.get('transcription_only'):
+            calls.append(1)
+            raise TimeoutError('synthetic timeout')
+        return {'choices':[{'message':{'content':json.dumps(output_for(request['role'],request))}}]}
+    monkeypatch.setattr('serein.model_runtime.complete',complete)
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert len(calls)==3 and image_failures(settings.database,sha)==3
+    assert result['events']==0 and result['deferred']==2

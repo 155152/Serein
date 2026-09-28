@@ -136,7 +136,9 @@ def test_individual_message_routes_and_bridge_ownership(settings):
     first = assignments[0]['primary_track_id']
     second = assignments[1]['primary_track_id']
     assert first != second
-    components = {item['track_ids'][0]: item for item in data['components']}
+    assert len(data['components']) == 2
+    components = {item['track_ids'][0]: item for item in p.components(
+        settings.database, {**data, 'joint_review': False}, data['routing_result'])}
     assert set(components) == {first, second}
 
     first_component = components[first]
@@ -149,12 +151,14 @@ def test_individual_message_routes_and_bridge_ownership(settings):
     assert first_component['context_edges'] == expected_edge
     assert second_component['context_edges'] == expected_edge
 
+    review={'events':[{'event_index':0,'reason':'Synthetic owned activity'}],
+            'boundaries':[],'dispositions':[]}
     first_plan = {'events': [{'action': 'create', 'primary_track_id': first,
                               'base_event_ids': [], 'owned_unit_roots': [1, 3]}],
-                  'skip_unit_roots': [], 'defer_unit_roots': []}
+                  'skip_unit_roots': [], 'defer_unit_roots': [],'decision_review':review}
     second_plan = {'events': [{'action': 'create', 'primary_track_id': second,
                                'base_event_ids': [], 'owned_unit_roots': [2, 3, 4]}],
-                   'skip_unit_roots': [], 'defer_unit_roots': []}
+                   'skip_unit_roots': [], 'defer_unit_roots': [],'decision_review':review}
     normalized_first = latest.normalize_event_curator_output(first_plan, first_component)
     normalized_second = latest.normalize_event_curator_output(second_plan, second_component)
     assert normalized_first['events'][0]['source_message_ids'] == [1, 3]
@@ -197,8 +201,33 @@ def _two_track_bridge_batch(settings):
     assignments = data['routing_result']['assignments']
     first = assignments[0]['primary_track_id']
     second = assignments[1]['primary_track_id']
-    components = {item['track_ids'][0]: item for item in data['components']}
+    components = {item['track_ids'][0]: item for item in p.components(
+        settings.database, {**data, 'joint_review': False}, data['routing_result'])}
     return batch, data, first, second, components[first], components[second]
+
+
+def test_joint_curator_requires_declared_bridge_evidence(settings):
+    save_settings(settings.database, {'pipeline': {'joint_review_enabled': True}})
+    batch, data, first, second, _, _ = _two_track_bridge_batch(settings)
+    component = data['components'][0]
+    assert set(component['track_ids']) == {first, second}
+    proposal = {'events': [{'action': 'create', 'primary_track_id': first,
+                            'base_event_ids': [], 'owned_unit_roots': [1, 2, 3, 4]}],
+                'skip_unit_roots': [], 'defer_unit_roots': [],
+                'decision_review': {'events': [{'event_index': 0, 'reason': 'One continued map check'}],
+                                    'boundaries': [], 'dispositions': [],
+                                    'continuations': [{'event_index': 0, 'left_track_id': first,
+                                                       'right_track_id': second, 'bridge_unit_root': 3,
+                                                       'reason': 'The second check continues the first',
+                                                       'evidence': [
+                                                           {'source_message_id': 3, 'quote': 'Synthetic turn 3'},
+                                                           {'source_message_id': 2, 'quote': 'Synthetic turn 2'}]}]}}
+    plan = latest.normalize_event_curator_output(proposal, component)
+    assert len(plan['events']) == 1
+    assert set(plan['events'][0]['source_message_ids']) == {1, 2, 3, 4}
+    proposal['decision_review']['continuations'][0]['evidence'][1]['quote'] = 'missing quote'
+    with pytest.raises(ValueError, match='verbatim'):
+        latest.normalize_event_curator_output(proposal, component)
 
 
 def test_bridge_deferral_on_one_corridor_blocks_global_source_settlement(settings):
@@ -207,6 +236,8 @@ def test_bridge_deferral_on_one_corridor_blocks_global_source_settlement(setting
         'events': [{'action': 'create', 'primary_track_id': first,
                     'base_event_ids': [], 'owned_unit_roots': [1, 3]}],
         'skip_unit_roots': [], 'defer_unit_roots': [],
+        'decision_review': {'events':[{'event_index':0,'reason':'Synthetic owned activity'}],
+                            'boundaries':[],'dispositions':[]},
     }, first_component)
 
     second_component['base_event_candidates'] = [{
@@ -222,6 +253,9 @@ def test_bridge_deferral_on_one_corridor_blocks_global_source_settlement(setting
         'events': [{'action': 'extend', 'primary_track_id': second,
                     'base_event_ids': ['protected-base'], 'owned_unit_roots': [3]}],
         'skip_unit_roots': [4], 'defer_unit_roots': [],
+        'decision_review': {'events':[{'event_index':0,'reason':'Synthetic protected continuation'}],
+                            'boundaries':[],'dispositions':[{'disposition':'skip','unit_roots':[4],
+                                'reason':'Synthetic unrelated unit','parked_source_message_ids':[]}]},
     }, second_component)
     assert second_plan['events'] == []
     assert set(second_plan['defer_source_message_ids']) == {2, 3}
@@ -242,17 +276,51 @@ def test_bridge_deferral_on_one_corridor_blocks_global_source_settlement(setting
     assert outcomes == {1: 'settled', 4: 'skipped'}
 
 
+def test_protected_append_requires_explicit_opt_in_and_new_stable_source(settings):
+    _, _, _, second, _, component = _two_track_bridge_batch(settings)
+    session = component['messages'][0]['session_id']
+    component['context_messages'].append({**component['messages'][0], 'id': 10,
+                                          'content': 'The notebook cover was loose.'})
+    component['base_event_candidates'] = [{
+        'event_id': 'earlier-notebook', 'primary_track_id': second,
+        'session_ids': [session], 'source_message_ids': [10],
+        'predecessor_event_ids': [], 'active': True, 'protected': True,
+        'continuation_allowed': True,
+    }]
+    proposal = {'events': [{'action': 'extend', 'primary_track_id': second,
+                            'base_event_ids': ['earlier-notebook'], 'owned_unit_roots': [4]}],
+                'skip_unit_roots': [2, 3], 'defer_unit_roots': [],
+                'decision_review': {'events': [{'event_index': 0, 'reason': 'New stitch follows repair'}],
+                                    'boundaries': [], 'dispositions': [{
+                                        'disposition': 'skip', 'unit_roots': [2, 3],
+                                        'reason': 'Unrelated synthetic turns',
+                                        'parked_source_message_ids': []}]}}
+    without_opt_in = latest.normalize_event_curator_output(proposal, component)
+    assert without_opt_in['events'] == []
+    assert 4 in without_opt_in['defer_source_message_ids']
+    component['append_protected'] = True
+    with_opt_in = latest.normalize_event_curator_output(proposal, component)
+    assert len(with_opt_in['events']) == 1
+    assert with_opt_in['events'][0]['append_only'] is True
+    assert set(with_opt_in['events'][0]['source_message_ids']) == {4, 10}
+
+
 def test_bridge_settlement_beats_other_corridor_skip(settings):
     batch, data, first, second, first_component, second_component = _two_track_bridge_batch(settings)
     first_plan = latest.normalize_event_curator_output({
         'events': [{'action': 'create', 'primary_track_id': first,
                     'base_event_ids': [], 'owned_unit_roots': [1, 3]}],
         'skip_unit_roots': [], 'defer_unit_roots': [],
+        'decision_review': {'events':[{'event_index':0,'reason':'Synthetic owned activity'}],
+                            'boundaries':[],'dispositions':[]},
     }, first_component)
     second_plan = latest.normalize_event_curator_output({
         'events': [{'action': 'create', 'primary_track_id': second,
                     'base_event_ids': [], 'owned_unit_roots': [2, 4]}],
         'skip_unit_roots': [3], 'defer_unit_roots': [],
+        'decision_review': {'events':[{'event_index':0,'reason':'Synthetic owned activity'}],
+                            'boundaries':[],'dispositions':[{'disposition':'skip','unit_roots':[3],
+                                'reason':'Synthetic bridge skipped here','parked_source_message_ids':[]}]},
     }, second_component)
     written = {'title': 'Synthetic', 'event_draft': 'Synthetic Event',
                'recallable': True, 'evidence_sufficient': True}
@@ -289,7 +357,8 @@ def test_track_anchor_continuation_and_parked_unused_state(settings):
         saved = {r['id']: json.loads(r['card_json']) for r in store.conn.execute('SELECT * FROM pipeline_tracks')}
     assert saved[key]['status'] == 'active'
     assert saved[key]['recent_source_message_ids'] == [4]
-    assert saved[unused['track_id']]['status'] == 'parked'
+    # A card without any durable routed activity is no longer a visible candidate.
+    assert saved[unused['track_id']]['status'] == 'active'
 
 
 def test_new_track_ordinal_uses_max_not_count_and_preserves_policy():
@@ -309,7 +378,7 @@ def test_new_track_ordinal_uses_max_not_count_and_preserves_policy():
     assert assigned[0]['primary_track_id'] == 'session_current_track_0043' and ordinal == 44
 
 
-def test_previous_visible_window_boundaries_and_old_anchor_rehydration(settings):
+def test_recent_route_boundaries_and_old_anchor_rehydration(settings):
     archive = raw_archive(settings)
     def add(session, number, workspace='one', metadata=None):
         archive.ingest([{'source_event_id': str(number), 'session_id': session, 'role': 'user',
@@ -328,9 +397,89 @@ def test_previous_visible_window_boundaries_and_old_anchor_rehydration(settings)
         # A high ordinal whose last window moved must still reserve its ID.
         tracks.persist(store.conn, [card('session_'+scopes['c']+'_track_0042', last_session_id='elsewhere')], scopes['c'])
         cards, ordinal = tracks.load_tracks(store, 'test', 'c', 5, p.message)
-    assert {c['track_id'] for c in cards} == {b_key, 'session_'+scopes['c']+'_track_0001'}
+        assert {c['track_id'] for c in cards} == {b_key}
     assert next(c for c in cards if c['track_id'] == b_key)['recent_turns'][0]['message_id'] == 2
     assert ordinal == 43
+
+
+def test_track_lookback_crosses_sessions_without_window_metadata(settings):
+    archive=raw_archive(settings)
+    for session,stamp in [('old','2026-09-19T11:59:59Z'),
+                          ('first','2026-09-20T12:00:00Z'),
+                          ('middle','2026-09-21T12:00:00Z'),
+                          ('current','2026-09-23T12:00:00Z')]:
+        archive.ingest([{'source_event_id':session,'session_id':session,'role':'user',
+                         'text':'Synthetic '+session,'created_at':stamp}],source='test')
+    p.initialize(settings.database)
+    with Store(settings.database) as store:
+        for raw in store.conn.execute('SELECT id,session_id FROM raw_events WHERE id<4'):
+            key='session_'+tracks.scope_for('test',raw['session_id'])+'_track_0001'
+            tracks.persist(store.conn,[card(key)],tracks.scope_for('test',raw['session_id']))
+            store.conn.execute('INSERT INTO pipeline_routes VALUES (?,?)',(raw['id'],encode({
+                'source_message_id':raw['id'],'primary_track_id':key,'context_track_ids':[],
+                'routing_role':'origin'})))
+        three_days,_=tracks.load_tracks(store,'test','current',4,p.message)
+        one_day,_=tracks.load_tracks(store,'test','current',4,p.message,lookback_days=1)
+        seven_days,_=tracks.load_tracks(store,'test','current',4,p.message,lookback_days=7)
+    assert {c['recent_turns'][0]['text'] for c in three_days}=={
+        'Synthetic first','Synthetic middle'}
+    assert one_day==[]
+    assert {c['recent_turns'][0]['text'] for c in seven_days}=={
+        'Synthetic old','Synthetic first','Synthetic middle'}
+
+
+def test_track_lookback_keeps_runtime_boundary_and_latest_activity(settings):
+    archive=raw_archive(settings)
+    for session,stamp,workspace in [
+        ('first','2026-09-19T00:00:00Z','one'),
+        ('foreign','2026-09-22T12:00:00Z','two'),
+        ('first','2026-09-23T11:00:00Z','one'),
+        ('current','2026-09-23T12:00:00Z','one')]:
+        archive.ingest([{'source_event_id':session+stamp,'session_id':session,'role':'user',
+                         'text':'Synthetic '+session+stamp,'created_at':stamp,
+                         'metadata':{'runtime':'synthetic','workspace_root':workspace}}],source='test')
+    p.initialize(settings.database)
+    with Store(settings.database) as store:
+        first='session_'+tracks.scope_for('test','first')+'_track_0001'
+        foreign='session_'+tracks.scope_for('test','foreign')+'_track_0001'
+        tracks.persist(store.conn,[card(first)],tracks.scope_for('test','first'))
+        tracks.persist(store.conn,[card(foreign)],tracks.scope_for('test','foreign'))
+        for raw_id,key in [(1,first),(2,foreign),(3,first)]:
+            store.conn.execute('INSERT INTO pipeline_routes VALUES (?,?)',(raw_id,encode({
+                'source_message_id':raw_id,'primary_track_id':key,'context_track_ids':[],
+                'routing_role':'origin'})))
+        cards,_=tracks.load_tracks(store,'test','current',4,p.message)
+    assert [c['track_id'] for c in cards]==[first]
+    assert cards[0]['recent_source_message_ids']==[3]
+
+
+@pytest.mark.parametrize('days,visible',[(1,False),(3,True)])
+def test_pipeline_setting_controls_router_track_visibility(settings,days,visible):
+    save_settings(settings.database,{'pipeline':{'track_lookback_days':days}})
+    raw_archive(settings).ingest([
+        {'source_event_id':'old-user','session_id':'old','role':'user',
+         'text':'Earlier synthetic request','created_at':'2026-09-21T12:00:00Z'},
+        {'source_event_id':'old-answer','session_id':'old','role':'assistant',
+         'text':'Earlier synthetic answer','created_at':'2026-09-21T12:00:01Z'},
+        {'source_event_id':'new-user','session_id':'new','role':'user',
+         'text':'New synthetic request','created_at':'2026-09-23T12:00:00Z'},
+        {'source_event_id':'new-answer','session_id':'new','role':'assistant',
+         'text':'New synthetic answer','created_at':'2026-09-23T12:00:01Z'},
+    ],source='test')
+    p.initialize(settings.database)
+    old_scope=tracks.scope_for('test','old')
+    key='session_'+old_scope+'_track_0001'
+    with Store(settings.database) as store:
+        tracks.persist(store.conn,[card(key)],old_scope)
+        store.conn.execute('INSERT INTO pipeline_routes VALUES (?,?)',(2,encode({
+            'source_message_id':2,'primary_track_id':key,'context_track_ids':[],
+            'routing_role':'primary_activity'})))
+        for raw_id in (1,2):
+            store.conn.execute('INSERT INTO raw_processing VALUES (?,?,?)',(raw_id,'synthetic-earlier','settled'))
+    batch=p.new_batch(settings.database,True,datetime(2026,9,23,13,tzinfo=timezone.utc))
+    assert batch is not None
+    data=json.loads(batch['input_json'])
+    assert (key in {item['track_id'] for item in data['tracks']}) is visible
 
 
 def test_context_only_track_keeps_anchor_and_last_real_window():
@@ -346,12 +495,14 @@ def test_context_only_track_keeps_anchor_and_last_real_window():
     assert by_id['unused']['status'] == 'parked' and by_id['unused']['last_session_id'] == 'previous'
 
 
-def test_old_pending_contract_is_retired_without_processing_raw_data(settings):
+@pytest.mark.parametrize('old_contract', ['public-event-scene-context-v1',
+                                          'public-event-message-tracks-v7'])
+def test_old_pending_contract_is_retired_without_processing_raw_data(settings, old_contract):
     ingest(settings)
     p.initialize(settings.database)
     batch = p.new_batch(settings.database, True)
     with Store(settings.database) as store:
-        data = json.loads(batch['input_json']);data['contract'] = 'public-event-scene-context-v1'
+        data = json.loads(batch['input_json']);data['contract'] = old_contract
         store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?', (encode(data), batch['id']))
     p.initialize(settings.database)
     with Store(settings.database, read_only=True) as store:

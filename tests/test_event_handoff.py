@@ -12,6 +12,77 @@ PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
 
 
 @pytest.mark.parametrize('mode',['agent','api'])
+def test_null_context_requests_save_and_resume_without_rereading(settings,monkeypatch,mode):
+    ingest(settings);seen=[]
+    def no_reread(*args):raise AssertionError('null must not trigger a context read')
+    monkeypatch.setattr(p,'extend_context',no_reread)
+    def result_for(request):
+        role=request['role'];seen.append(role)
+        result=output_for(role,request)
+        if role in ('event_curator','event_writer'):
+            assert 'context_request: null' in request['prompt']
+            assert 'context_request' in request['rules']
+            result['context_request']=None
+            p.validate({**request,'context_read':True},result)
+            with pytest.raises(ValueError):p.validate(request,{'context_request':None})
+        return result
+    if mode=='api':
+        save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
+            'assignments':{role:'local' for role in p.ROLES},'pipeline':{'execution_mode':'api'}})
+        async def complete(model,payload):
+            with Store(settings.database,read_only=True) as store:
+                request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+            return {'choices':[{'message':{'content':json.dumps(result_for(request))}}]}
+        monkeypatch.setattr('serein.model_runtime.complete',complete)
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    if mode=='agent':
+        while result['status']=='awaiting_agent':
+            p.submit(settings.database,result['job_id'],result_for(result['request']))
+            result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert result['events']==1 and result['processed_originals']==2
+    assert seen==list(p.ROLES)
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM pipeline_attempts WHERE error!=?',('',)).fetchone()[0]==0
+
+
+@pytest.mark.parametrize('role',['event_curator','event_writer'])
+def test_nonnull_context_requests_keep_scope_shape_and_single_read_limits(settings,role):
+    ingest(settings)
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    p.submit(settings.database,task['job_id'],output_for(task['role'],task['request']))
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    request={**task['request'],'role':role};component=request['component']
+    query={'track_id':component['track_ids'][0],'before_message_id':min(m['id'] for m in component['messages']),'reason':'missing_subject'}
+    p.validate(request,{'context_request':query})
+    invalid=[{},[],False,'request',0,{**query,'track_id':'foreign'},
+             {**query,'before_message_id':-1},{**query,'reason':'more_context'},{**query,'extra':True}]
+    for value in invalid:
+        with pytest.raises(ValueError):p.validate(request,{'context_request':value})
+    with pytest.raises(ValueError):p.validate(request,{'context_request':query,'events':[]})
+    with pytest.raises(ValueError):p.validate({**request,'context_read':True},{'context_request':query})
+
+
+@pytest.mark.parametrize('role',['event_curator','event_writer'])
+def test_null_final_result_after_one_context_read(settings,monkeypatch,role):
+    ingest(settings);reads=[];original=p.extend_context
+    def reread(database,component,query):
+        reads.append(query)
+        return original(database,component,query)
+    monkeypatch.setattr(p,'extend_context',reread)
+    async def runner(stage,request):
+        if stage==role and not request.get('context_read'):
+            return {'context_request':{'track_id':request['component']['track_ids'][0],
+                'before_message_id':min(m['id'] for m in request['component']['messages']),'reason':'missing_subject'}}
+        result=output_for(stage,request)
+        if stage==role:
+            assert request['context_read'] and '不得再次返回非空 context_request' in request['prompt']
+            result['context_request']=None
+        return result
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))['events']==1
+    assert len(reads)==1
+
+
+@pytest.mark.parametrize('mode',['agent','api'])
 def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(settings,monkeypatch,mode):
     import base64
     import hashlib
@@ -24,12 +95,15 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
         'assignments':{role:'local' for role in p.ROLES},'pipeline':{'execution_mode':mode}})
     seen=[];sha=hashlib.sha256(base64.b64decode(PNG.split(',')[1])).hexdigest()
     def check(request):
-        role=request['role'];seen.append(role)
+        role=request['role'];seen.append(request['execution']['task'])
         assert role in ('track_router','event_curator','event_writer')
-        if role=='event_curator':
+        if request.get('transcription_only'):
             assert request['images'][0]['url']==PNG and request['images'][0]['sha256']==sha
             assert request['images'][0]['source_message_id']==1
             assert PNG not in request['prompt']
+            return {'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]}
+        if role=='event_curator':
+            assert request['images']==[] and request['pretranscribed']
         if role=='event_writer':
             assert request['images']==[] and request['image_input_mode']=='transcriptions_only'
             assert request['curator_image_transcriptions']==[{'source_message_id':1,'position':1,'sha256':sha,
@@ -39,23 +113,27 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
         assert mode=='api','Agent mode must not call the API'
         with Store(settings.database,read_only=True) as store:
             request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
-        if request['role']=='event_curator':assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
+        if request.get('images'):
+            assert request['images'][0]['url']=='[frozen task image]'
+            from serein.extensions.pipeline_images import hydrate_request_images
+            request=hydrate_request_images(settings.database,request['batch_id'],request)
+        if request.get('transcription_only'):assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
         if request['role']=='event_writer':
             assert isinstance(payload['messages'][1]['content'],str) and PNG not in payload['messages'][1]['content']
         result=check(request)
         if request['role']=='event_writer' and seen.count('event_writer')==1:
-            result['self_review']['result_preserved']=False
+            result['sentence_evidence'][0]['source_spans'][0]['quote']='not in original'
         return {'choices':[{'message':{'content':json.dumps(result)}}]}
     monkeypatch.setattr('serein.model_runtime.complete',complete)
     result=asyncio.run(p.advance(settings.database,include_recent=True))
     if mode=='agent':
-        for role in p.ROLES:
-            assert result['role']==role
+        for task in ['track_router','image_transcription','event_curator','event_writer']:
+            assert result['request']['execution']['task']==task
             output=check(result['request'])
             p.submit(settings.database,result['job_id'],output)
             result=asyncio.run(p.advance(settings.database,include_recent=True))
     assert result['events']==1 and result['processed_originals']==2
-    assert seen==list(p.ROLES)+(['event_writer'] if mode=='api' else [])
+    assert seen==['track_router','image_transcription','event_curator','event_writer']+(['event_writer'] if mode=='api' else [])
     with Store(settings.database,read_only=True) as store:
         details=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in details and details['curator_image_transcriptions'][0]['sha256']==sha
@@ -75,7 +153,9 @@ def shared_proposals():
     component={'messages':messages,'context_messages':messages,'track_ids':list('abcd'),
                'memberships':units,'context_edges':[{'unit_root_message_id':2,'track_id':'b'},{'unit_root_message_id':4,'track_id':'c'}],
                'base_event_candidates':[{'event_id':'protected','primary_track_id':'a','source_message_ids':[90],'session_ids':[1],'manual':True}]}
-    proposals={'events':[{'action':'extend' if t=='a' else 'create','base_event_ids':['protected'] if t=='a' else [],'primary_track_id':t,'owned_unit_roots':ids} for t,ids in zip('abcd',([1,2],[2,3,4],[4,5],[6,7]))],'skip_unit_roots':[],'defer_unit_roots':[]}
+    proposals={'events':[{'action':'extend' if t=='a' else 'create','base_event_ids':['protected'] if t=='a' else [],'primary_track_id':t,'owned_unit_roots':ids} for t,ids in zip('abcd',([1,2],[2,3,4],[4,5],[6,7]))],'skip_unit_roots':[],'defer_unit_roots':[],
+               'decision_review':{'events':[{'event_index':i,'reason':f'Synthetic Track {i} activity'} for i in range(4)],
+                                  'boundaries':[],'dispositions':[]}}
     return component,proposals
 
 
@@ -116,10 +196,11 @@ def test_images_are_frozen_and_transcriptions_cannot_claim_provenance():
 def test_writer_structure_without_lexical_style_rejection():
     value=output_for('event_writer',{'messages':[{'content':'Synthetic'}]})
     value['event_draft']='我笑称这是一场小小的试验。她说不确定，我说可以再试，她提醒我先记录条件。'
+    value['sentence_evidence'][0]['sentence']=value['event_draft']
     assert 'result_or_unfinished' not in value
     assert latest.validate_event_writer_result(value)==[]
     value['self_review']['result_preserved']=False
-    assert latest.validate_event_writer_result(value)
+    assert latest.validate_event_writer_result(value)==[]
 
 
 def test_api_configuration_conflicts_and_execution_freezes_all_stage_models(settings,monkeypatch):
@@ -192,7 +273,10 @@ def test_completed_task_media_expires_after_seven_days_but_raw_archive_and_text_
     raw_archive(settings).ingest([
         {'source_event_id':'image','session_id':'one','role':'user','text':'The book title','created_at':'2025-01-01T00:00:00Z','metadata':{'attachments':[{'kind':'image','url':PNG}]}},
         {'source_event_id':'reply','session_id':'one','role':'assistant','text':'Agreed','created_at':'2025-01-01T00:01:00Z'}],source='synthetic')
-    async def runner(role,request):return output_for(role,request)
+    async def runner(role,request):
+        if request.get('transcription_only'):
+            return {'image_transcriptions':[{'input_image':1,'text':'Visible book title','unreadable':False}]}
+        return output_for(role,request)
     asyncio.run(p.advance(settings.database,include_recent=True,runner=runner))
     with Store(settings.database) as store:
         store.conn.execute("UPDATE pipeline_batches SET result_json=json_set(result_json,'$.completed_at','2000-01-01T00:00:00Z') WHERE status='done'")

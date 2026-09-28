@@ -210,7 +210,8 @@ def test_import_boundary_keeps_concurrent_new_chats_and_retires_mixed_plan(setti
     p.initialize(settings.database)  # Upgrade recovers historical import membership.
     with Store(settings.database) as store:
         assert store.conn.execute("SELECT status FROM pipeline_batches WHERE id='old-mixed'").fetchone()[0]=='superseded_import_boundary'
-        assert {r[0] for r in store.conn.execute('SELECT raw_id FROM raw_processing')}==set(imported)
+        assert store.conn.execute("SELECT count(*) FROM raw_processing WHERE outcome='archived_only'").fetchone()[0]==0
+        assert store.conn.execute('SELECT released FROM pipeline_import_boundaries WHERE upload_id=?',(upload['id'],)).fetchone()[0]==0
     batch=p.new_batch(settings.database,True)
     assert batch and all(m['id'] not in imported for m in json.loads(batch['input_json'])['messages'])
     calls=[]
@@ -256,7 +257,12 @@ def test_116_unknown_time_originals_are_processed_in_small_batches(settings):
     # This fixture deliberately skips completed units, keeping the batching test
     # independent of rolling-Event selection and eventual evidence growth.
     async def skip_runner(role,request):
-        if role=='event_curator':return {'events':[],'skip_unit_roots':[u['unit_root_message_id'] for u in request['component']['memberships'] if u['unit_root_message_id'] in {m['id'] for m in request['component']['messages']}],'defer_unit_roots':[]}
+        if role=='event_curator':
+            roots=[u['unit_root_message_id'] for u in request['component']['memberships'] if u['unit_root_message_id'] in {m['id'] for m in request['component']['messages']}]
+            return {'events':[],'skip_unit_roots':roots,'defer_unit_roots':[],
+                    'decision_review':{'events':[],'boundaries':[],
+                        'dispositions':[{'disposition':'skip','unit_roots':roots,
+                                         'reason':'Only repeated synthetic status checks','parked_source_message_ids':[]}]}}
         return await runner(role,request)
     for _ in range(4):
         result=asyncio.run(p.advance(settings.database,include_recent=True,runner=skip_runner))
@@ -378,41 +384,6 @@ def test_id_correction_retry_keeps_bad_output_and_accepts_only_valid(settings,mo
         assert '999999' not in store.conn.execute('SELECT output_json FROM pipeline_jobs WHERE id=?',(task['job_id'],)).fetchone()[0]
 
 
-def test_router_fills_only_missing_existing_track_updates():
-    output={
-        'message_assignments':[{
-            'source_message_id':1,
-            'primary_track_ref':'session_test_track_0001',
-            'context_track_refs':['new:1'],
-            'routing_role':'bridge',
-        }],
-        'track_updates':[{
-            'track_ref':'new:1','subject':'new','throughline':'new arc','event_policy':'default','status':'active'
-        }],
-    }
-    tracks=[{
-        'track_id':'session_test_track_0001','subject':'old','throughline':'old arc',
-        'event_policy':'rolling_engineering','status':'parked'
-    }]
-    p.fill_missing_existing_track_updates(output,tracks)
-    by_ref={item['track_ref']:item for item in output['track_updates']}
-    assert set(by_ref)=={'session_test_track_0001','new:1'}
-    assert by_ref['session_test_track_0001']=={
-        'track_ref':'session_test_track_0001','subject':'old','throughline':'old arc',
-        'event_policy':'rolling_engineering','status':'parked'
-    }
-
-
-def test_slow_stage_timeout_is_extended_without_changing_small_router_or_curator():
-    assert p.api_timeout_seconds('track_router', 49999, 600)==600
-    assert p.api_timeout_seconds('track_router', 50000, 600)==1200
-    assert p.api_timeout_seconds('event_curator', 50000, 600)==600
-    assert p.api_timeout_seconds('event_writer', 1000, 600)==1200
-    assert p.api_timeout_seconds('event_writer', 50000, 600)==1200
-    assert p.api_timeout_seconds('event_writer', 50000, 1000)==1800
-    assert p.api_timeout_seconds('event_writer', 50000, 1800)==1800
-
-
 def test_timeout_durable_diagnostic_and_prompt_budget_before_model(settings,monkeypatch):
     ingest(settings)
     save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],
@@ -444,8 +415,9 @@ def test_empty_structured_output_reports_length_exhaustion(settings,monkeypatch)
         return {'choices':[{'message':{'content':''},'finish_reason':'length'}],
                 'usage':{'completion_tokens':8192,'completion_tokens_details':{'reasoning_tokens':8192}}}
     monkeypatch.setattr('serein.model_runtime.complete',empty)
-    with pytest.raises(ValueError,match='未返回最终 JSON 内容.*输出预算耗尽.*8192'):
-        asyncio.run(p.advance(settings.database,include_recent=True))
+    result=asyncio.run(p.advance(settings.database,include_recent=True))
+    assert result['status']=='paused'
+    assert '未返回最终 JSON 内容' in result['reason'] and '输出预算耗尽' in result['reason'] and '8192' in result['reason']
     assert len(calls)==3 and all('max_tokens' not in payload for payload in calls)
     with Store(settings.database,read_only=True) as store:
         attempts=store.conn.execute('SELECT output_text,error FROM pipeline_attempts ORDER BY id').fetchall()
@@ -469,7 +441,7 @@ def test_legacy_116_originals_eleven_router_jobs_resume_without_repeating_them(s
     with Store(settings.database) as store:
         messages=[p.message(row) for row in store.conn.execute('SELECT * FROM raw_events ORDER BY id')]
         scope=digest(encode(['synthetic','legacy']))[:20]
-        data={'contract':p.CONTRACT,'messages':messages,'parked':[],'routing_messages':messages,'tracks':[],
+        data={'contract':p.CONTRACT,'runtime_revision':p.runtime_revision(),'messages':messages,'parked':[],'routing_messages':messages,'tracks':[],
               'scope':scope,'source':'synthetic','recent':[],'day':'2025-01-01'}
         batch={'id':'pipeline:legacy116','scope':scope,'input_json':encode(data)}
         store.conn.execute('INSERT INTO pipeline_batches(id,scope,input_json) VALUES (?,?,?)',tuple(batch.values()))

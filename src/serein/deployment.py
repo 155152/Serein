@@ -51,7 +51,10 @@ def read_from_store(store):
             'tagging': saved.get('tagging', {'domains': DEFAULT_DOMAINS}),
             'tagging_version': saved.get('tagging_version', 1),
             'dream': {'main_prompt':'', 'daily_probability':0.4, **saved.get('dream', {})},
-            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':12000,'max_prompt_chars':40000,'timeout_seconds':600,'event_writer_concurrency':1, **saved.get('pipeline',{})},
+            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':12000,'max_prompt_chars':40000,'timeout_seconds':600,'event_writer_concurrency':1,'track_lookback_days':3,
+                         'joint_review_enabled':False,'material_review_enabled':False,'round_gate_enabled':False,
+                         'append_protected_enabled':False,
+                         **saved.get('pipeline',{})},
             'assignments': {key:value for key,value in saved.get('assignments', {}).items() if key!='event_evidence'}}
 
 
@@ -187,6 +190,12 @@ def save_settings(database, changes):
         writer_concurrency=current['pipeline'].get('event_writer_concurrency',1)
         if type(writer_concurrency) is not int or not 1<=writer_concurrency<=8:
             raise ValueError('Event Writer concurrency must be an integer between 1 and 8')
+        lookback_days=current['pipeline'].get('track_lookback_days',3)
+        if type(lookback_days) is not int or not 1<=lookback_days<=365:
+            raise ValueError('Track lookback must be an integer between 1 and 365 days')
+        for key in ('joint_review_enabled','material_review_enabled','round_gate_enabled','append_protected_enabled'):
+            if type(current['pipeline'].get(key,False)) is not bool:
+                raise ValueError(f'{key} must be a boolean')
         mode=current['pipeline']['execution_mode']
         if mode not in ('legacy','api','agent'):raise ValueError('Unknown Event execution mode')
         if mode=='api':

@@ -363,6 +363,7 @@ export async function readLiveWindowShadows() {
       title,
       summary: summary.length <= 96 ? summary : `${summary.slice(0, 95)}…`,
       text,
+      sections: item?.sections ?? {},
       scenes: Array.isArray(item?.scenes) ? item.scenes : [],
       sourceLabel: "Serein",
       statusLabel: "已入库窗影",
@@ -789,7 +790,7 @@ function sereinMemoryBridge() {
         response.setHeader("Content-Type","application/json; charset=utf-8");
         response.setHeader("Cache-Control","no-store");
         const action=request.url?.split("?")[0];
-        if(!(request.method==="GET" && (action==="/status" || /^\/attempts\/\d+$/.test(action))) && !(request.method==="POST" && ["/next","/submit","/rebuild"].includes(action))) {
+        if(!(request.method==="GET" && (action==="/status" || /^\/attempts\/\d+$/.test(action))) && !(request.method==="POST" && ["/next","/submit","/rebuild","/retry-image","/retry-batch"].includes(action))) {
           response.statusCode=405;response.end(JSON.stringify({error:"method_not_allowed"}));return;
         }
         if(request.method==="POST" && (!String(request.headers["content-type"]).startsWith("application/json") ||
