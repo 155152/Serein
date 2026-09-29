@@ -1,13 +1,14 @@
 import asyncio
 import copy
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import pytest
 from test_public_features import settings, ingest, output_for, synthetic_runner, raw_archive
-from serein.core.store import Store, promoted_scene_id
+from serein.core.store import Store
 from serein.deployment import save_settings
 from serein.extensions import pipeline as p
 from serein.extensions import pipeline_latest as latest
+from serein.extensions.pipeline_rules import normalize_event_track_message_output
 
 
 def curator_task(settings):
@@ -17,6 +18,162 @@ def curator_task(settings):
         task=asyncio.run(p.advance(settings.database,include_recent=True))
     assert task['role']=='event_curator'
     return task
+
+
+def test_router_ignores_extra_fields_but_identifies_missing_track_updates():
+    messages = [{'id': 11}]
+    output = {
+        'message_assignments': [{'source_message_id': 11, 'primary_track_ref': 'existing',
+                                 'context_track_refs': [], 'routing_role': 'primary_activity', 'note': 'extra'}],
+        'track_updates': []}
+    tracks = [{'track_id': 'existing', 'subject': 'Plan', 'throughline': 'Keep planning', 'status': 'active'}]
+    def normalize():
+        return normalize_event_track_message_output(output, messages, tracks,
+                                                    session_id=1, next_track_ordinal=1)
+    output['comment'] = 'extra top-level field'
+    with pytest.raises(ValueError, match=r"missing=\['existing'\], unused=\[\]"):
+        normalize()
+    output['track_updates'].append({'track_ref': 'existing', 'subject': 'Plan',
+                                    'throughline': 'Keep planning', 'status': 'active', 'note': 'extra'})
+    assert normalize()[0][0]['primary_track_id'] == 'existing'
+    del output['message_assignments'][0]['routing_role']
+    with pytest.raises(ValueError, match=r"assignment #1 fields missing: \['routing_role'\]"):
+        normalize()
+
+
+def test_router_extra_fields_are_removed_from_saved_job(settings):
+    ingest(settings)
+    task = asyncio.run(p.advance(settings.database, include_recent=True))
+    output = output_for('track_router', task['request'])
+    output['comment'] = 'extra'
+    output['message_assignments'][0]['note'] = 'extra'
+    output['track_updates'][0]['note'] = 'extra'
+    p.submit(settings.database, task['job_id'], output)
+    with Store(settings.database, read_only=True) as store:
+        saved = json.loads(store.conn.execute('SELECT output_json FROM pipeline_jobs WHERE id=?',
+                                              (task['job_id'],)).fetchone()[0])
+    assert 'comment' not in saved
+    assert 'note' not in saved['message_assignments'][0]
+    assert 'note' not in saved['track_updates'][0]
+
+
+def test_curator_error_identifies_unaccounted_source(settings):
+    ingest(settings)
+    task = curator_task(settings)
+    output = output_for('event_curator', task['request'])
+    omitted = output['events'][0]['owned_unit_roots'].pop()
+    with pytest.raises(ValueError, match=f'unaccounted source_message_ids=\\[{omitted}\\]'):
+        p.validate(task['request'], output)
+
+
+def test_curator_repeated_omission_pauses_without_skipping(settings):
+    ingest(settings)
+    calls = []
+    async def runner(role, request):
+        output = output_for(role, request)
+        if role == 'event_curator':
+            calls.append(request['prompt'])
+            output['events'][0]['owned_unit_roots'].pop()
+        return output
+    result = asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
+    assert len(calls) == 2 and 'missing_messages' in calls[1] and 'previous_output' in calls[1]
+    assert result['status'] == 'paused'
+    with Store(settings.database, read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0] == 0
+
+
+def test_agent_curator_second_omission_pauses(settings):
+    ingest(settings)
+    task = curator_task(settings)
+    output = output_for('event_curator', task['request'])
+    output['events'][0]['owned_unit_roots'].pop()
+    with pytest.raises(latest.CuratorCoverageError):
+        p.submit(settings.database, task['job_id'], output)
+    with pytest.raises(p.PausedBatch):
+        p.submit(settings.database, task['job_id'], output)
+    with Store(settings.database, read_only=True) as store:
+        assert store.conn.execute('SELECT status FROM pipeline_batches WHERE id=?', (task['job_id'].split(':event_curator:')[0],)).fetchone()[0] == 'paused_failure'
+
+
+def test_repeated_curator_omission_pauses_and_retry_can_correct(settings):
+    ingest(settings)
+    fail = True
+    async def runner(role, request):
+        output = output_for(role, request)
+        if fail and role == 'event_curator':
+            output['events'][0]['owned_unit_roots'].pop()
+        return output
+    first = asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
+    assert first['status'] == 'paused' and '漏项修复失败' in first['reason']
+    with Store(settings.database, read_only=True) as store:
+        frozen = store.conn.execute('SELECT input_json FROM pipeline_batches WHERE id=?', (first['batch_id'],)).fetchone()[0]
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0] == 0
+    p.retry_batch(settings.database, first['batch_id'])
+    with Store(settings.database, read_only=True) as store:
+        assert store.conn.execute('SELECT input_json FROM pipeline_batches WHERE id=?', (first['batch_id'],)).fetchone()[0] == frozen
+    fail = False
+    assert asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))['events'] == 1
+
+
+def test_curator_api_omission_retries_once_then_pauses(settings, monkeypatch):
+    ingest(settings)
+    save_settings(settings.database, {
+        'models': [{'id': 'local', 'model': 'synthetic', 'base_url': 'http://127.0.0.1:9/v1'}],
+        'assignments': {role: 'local' for role in p.ROLES},
+        'pipeline': {'execution_mode': 'api'}})
+    curator_calls = []
+    async def complete(model, payload):
+        with Store(settings.database, read_only=True) as store:
+            request = json.loads(store.conn.execute(
+                'SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1'
+            ).fetchone()[0])
+        output = output_for(request['role'], request)
+        if request['role'] == 'event_curator':
+            curator_calls.append(payload)
+            output['events'][0]['owned_unit_roots'].pop()
+        return {'choices': [{'message': {'content': json.dumps(output)}}]}
+    monkeypatch.setattr('serein.model_runtime.complete', complete)
+    result = asyncio.run(p.advance(settings.database, include_recent=True))
+    assert len(curator_calls) == 2
+    assert 'missing_messages' in curator_calls[1]['messages'][1]['content']
+    assert result['status'] == 'paused'
+
+
+def test_writer_json_object_wrapper_is_removed_before_saving(settings):
+    ingest(settings)
+    curator = curator_task(settings)
+    p.submit(settings.database, curator['job_id'], output_for('event_curator', curator['request']))
+    task = asyncio.run(p.advance(settings.database, include_recent=True))
+    wrapped = {'type': 'json_object', 'content': output_for('event_writer', task['request'])}
+    p.submit(settings.database, task['job_id'], wrapped)
+    with Store(settings.database, read_only=True) as store:
+        saved = json.loads(store.conn.execute('SELECT output_json FROM pipeline_jobs WHERE id=?',
+                                              (task['job_id'],)).fetchone()[0])
+    assert saved['title'] == wrapped['content']['title']
+    assert 'type' not in saved and 'content' not in saved
+    assert asyncio.run(p.advance(settings.database, include_recent=True))['events'] == 1
+
+
+def test_writer_api_unwraps_json_object_without_retry(settings, monkeypatch):
+    ingest(settings)
+    curator = curator_task(settings)
+    p.submit(settings.database, curator['job_id'], output_for('event_curator', curator['request']))
+    save_settings(settings.database, {
+        'models': [{'id': 'local', 'model': 'synthetic', 'base_url': 'http://127.0.0.1:9/v1'}],
+        'assignments': {role: 'local' for role in p.ROLES},
+        'pipeline': {'execution_mode': 'api'}})
+    calls = []
+    async def complete(model, payload):
+        calls.append(payload)
+        with Store(settings.database, read_only=True) as store:
+            request = json.loads(store.conn.execute(
+                "SELECT request_json FROM pipeline_jobs WHERE role LIKE 'event_writer%' ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()[0])
+        wrapped = {'type': 'json_object', 'content': output_for('event_writer', request)}
+        return {'choices': [{'message': {'content': json.dumps(wrapped)}}]}
+    monkeypatch.setattr('serein.model_runtime.complete', complete)
+    assert asyncio.run(p.advance(settings.database, include_recent=True))['events'] == 1
+    assert len(calls) == 1
 
 
 def test_parked_correction_is_readable_but_not_owned(settings):
@@ -37,44 +194,6 @@ def test_parked_correction_is_readable_but_not_owned(settings):
                   'dispositions':[{'disposition':'defer','unit_roots':[m['id'] for m in component['messages']],
                                    'reason':'parked 原文撤回了约定时间','parked_source_message_ids':component['parked_context_source_ids']}]}}
     assert len(latest.normalize_event_curator_output(deferred,component)['defer_source_message_ids'])==2
-
-
-def test_foreign_primary_stable_bridge_must_be_explicitly_accounted():
-    messages=[
-        {'id':1,'session_id':1,'role':'user','content':'keep talking about the old activity','created_at':'2026-09-28T07:00:00+00:00','metadata':{}},
-        {'id':2,'session_id':1,'role':'assistant','content':'close the old activity and open the new one','created_at':'2026-09-28T07:01:00+00:00','metadata':{}},
-    ]
-    component={
-        'track_ids':['track-a'],
-        'track_cards':[{'track_id':'track-a','subject':'old activity','throughline':'continue it','event_policy':'default'}],
-        'messages':messages,
-        'context_messages':messages,
-        'parked_context_source_ids':[],
-        'memberships':[
-            {'unit_root_message_id':1,'source_message_ids':[1],'track_id':'track-a','session_id':1,'routing_role':'primary_activity'},
-            {'unit_root_message_id':2,'source_message_ids':[2],'track_id':'track-b','session_id':1,'routing_role':'bridge'},
-        ],
-        'context_edges':[{'unit_root_message_id':2,'track_id':'track-a','relation':'bridge'}],
-        'base_event_candidates':[],
-        'context_session_ids':[1],
-        'writer_material_review':False,
-        'writer_round_gate':False,
-        'append_protected':False,
-    }
-    prompt=latest.build_event_track_curator_prompt('2026-09-28',component)
-    assert 'foreign-primary bridge' in prompt
-    output={
-        'events':[{'action':'create','base_event_ids':[],'primary_track_id':'track-a','owned_unit_roots':[1]}],
-        'skip_unit_roots':[],
-        'defer_unit_roots':[],
-        'decision_review':{'events':[{'event_index':0,'reason':'the first unit is the old activity'}],
-                           'boundaries':[],'dispositions':[]},
-    }
-    with pytest.raises(ValueError,match=r'omitted stable source ids: \[2\]'):
-        latest.normalize_event_curator_output(output,component)
-    output['events'][0]['owned_unit_roots'].append(2)
-    normalized=latest.normalize_event_curator_output(output,component)
-    assert normalized['events'][0]['source_bindings'][-1]=={'source_message_id':2,'activity_role':'bridge'}
 
 
 def test_latest_rolling_policy_does_not_force_unrelated_leaves_and_defers_blockers(settings):
@@ -111,58 +230,12 @@ def test_three_stages_and_writer_sees_exact_predecessor_originals(settings):
     task=asyncio.run(p.advance(settings.database,include_recent=True));prompt=task['request']['prompt']
     assert len(task['request']['messages'])==4
     assert task['role']=='event_writer' and 'Book club plan 1' in prompt and 'Book club plan 2' in prompt
-    assert '<previous_events_json>' in prompt and '正文最多 1000 字' in prompt
+    assert '<previous_events_json>' in prompt and '正文通常控制在 500 字以内' in prompt
     assert task['request']['rules'] and task['request']['rules'] not in prompt
     with Store(settings.database) as store:
         detail=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in detail
         assert set(detail['source_activity_roles'])=={'1','2'}
-
-
-def test_scene_worthy_event_is_atomically_promoted_to_scene(settings):
-    ingest(settings)
-
-    async def runner(role, request):
-        output = output_for(role, request)
-        if role == 'event_writer':
-            output['scene_worthy'] = True
-        return output
-
-    result = asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
-    assert result['events'] == 1
-
-    with Store(settings.database, read_only=True) as store:
-        event_id = store.conn.execute(
-            "SELECT id FROM documents WHERE kind='event' ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()[0]
-        scene_id = promoted_scene_id(event_id)
-        event = store.read(event_id)
-        scene = store.read(scene_id)
-        assert scene is not None
-        assert scene['kind'] == 'scene'
-        assert scene['title'] == event['title']
-        assert scene['body_md'] == event['body_md']
-        assert scene['metadata']['memory_value_source'] == 'automatic_event_scene'
-        assert scene['metadata']['write_contract'] == 'event-to-scene-auto-v1'
-        assert scene['metadata']['scene_cues'] == ['Book club plan']
-        assert scene['metadata']['promoted_from_event']['id'] == event_id
-        event_sources = store.conn.execute(
-            "SELECT source_id FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY source_id",
-            (event_id,),
-        ).fetchall()
-        scene_sources = store.conn.execute(
-            "SELECT source_id FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY source_id",
-            (scene_id,),
-        ).fetchall()
-        assert [row[0] for row in scene_sources] == [row[0] for row in event_sources]
-        surface = store.surface_state(event_id)
-        assert 'promoted_to_scene' in surface['reasons']
-        assert 'covered_by_scene' in surface['reasons']
-        detail = json.loads(store.conn.execute(
-            "SELECT details_json FROM pipeline_event_details WHERE event_id=?",
-            (event_id,),
-        ).fetchone()[0])
-        assert detail['auto_scene'] == {'status': 'promoted', 'scene_id': scene_id}
 
 
 def test_settled_event_is_queued_only_when_arc_linker_is_selected(settings):
@@ -191,8 +264,8 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
     assert '正文超过容错上限 1500 字：1501 字' in ' '.join(latest.validate_event_writer_result(output))
     output['title']=''
     assert '标题为空' in latest.validate_event_writer_result(output)
-    output['kept_details']=['anchor']*7
-    assert any('必须有 1–6 项' in error for error in latest.validate_event_writer_result(output))
+    output['kept_details']=['anchor']*13
+    assert any('最多 12 项' in error for error in latest.validate_event_writer_result(output))
 
 
 def test_public_writer_materializes_source_grounded_rules_with_configured_names():
@@ -598,3 +671,23 @@ def test_image_api_counts_each_failed_request_and_waiting_agent_does_not(setting
     result=asyncio.run(p.advance(settings.database,include_recent=True))
     assert len(calls)==3 and image_failures(settings.database,sha)==3
     assert result['events']==0 and result['deferred']==2
+
+
+def test_curator_targeted_repair_can_finish(settings):
+    ingest(settings)
+    calls=[]
+    async def runner(role, request):
+        output=output_for(role, request)
+        if role=='event_curator':
+            calls.append(request)
+            if len(calls)==1:
+                output['events'][0]['owned_unit_roots'].pop()
+            else:
+                repair=json.loads(request['prompt'].split('\n')[-1])
+                assert repair['missing_messages']
+                assert [m['id'] for m in repair['missing_messages']]==repair['missing_source_message_ids']
+                assert repair['previous_output']['events'][0]['owned_unit_roots']
+                assert request['prompt'].startswith(calls[0]['prompt'])
+        return output
+    result=asyncio.run(p.advance(settings.database, include_recent=True, runner=runner))
+    assert result['events']==1 and len(calls)==2

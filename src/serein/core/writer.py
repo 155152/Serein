@@ -7,92 +7,6 @@ from uuid import uuid4
 from .store import Store, Conflict, digest, encode, now, promoted_scene_id
 
 
-def promote_event_in_store(store, event, title, body, *, cues=None,
-                           memory_value_source="authored_scene",
-                           write_contract="event-to-scene-v1",
-                           actor="assistant"):
-    if event["kind"] != "event" or event["lifecycle"] != "active":
-        raise Conflict("Only an active Event can become a Scene")
-    title, body = str(title or "").strip(), str(body or "").strip()
-    if not title or not body:
-        raise ValueError("Scene title and edited body are required")
-    bindings = store.conn.execute(
-        "SELECT source_id,metadata_json FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY id",
-        (event["id"],)).fetchall()
-    if not bindings:
-        raise ValueError("Event has no active original evidence to carry into the Scene")
-    scene_id = promoted_scene_id(event["id"])
-    if store.read(scene_id):
-        raise Conflict("This Event already has a promoted Scene; edit that Scene instead")
-    normalized_cues = []
-    for value in cues or []:
-        cue = " ".join(str(value or "").split()).strip()
-        if cue and cue not in normalized_cues:
-            normalized_cues.append(cue[:80])
-        if len(normalized_cues) >= 8:
-            break
-    domain = event["metadata"].get("canonical_domain") or "general"
-    scene = store.create(
-        scene_id, "scene", title, body,
-        metadata={
-            "object_kind": "scene",
-            "memory_value_source": memory_value_source,
-            "write_contract": write_contract,
-            "scene_cues": normalized_cues,
-            "canonical_domain": domain,
-            "domain": [domain],
-            "date": event["metadata"].get("local_date") or "",
-            "created": now(),
-            "promoted_from_event": {
-                "id": event["id"],
-                "revision": event["revision"],
-                "body_sha256": event["body_sha256"],
-            },
-        },
-    )
-    for binding in bindings:
-        store.bind(
-            scene_id,
-            binding["source_id"],
-            metadata=json.loads(binding["metadata_json"]),
-            actor=actor,
-        )
-    if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='scene_evidence_ids'").fetchone():
-        store.conn.execute(
-            "INSERT OR IGNORE INTO scene_evidence_ids(binding_id) "
-            "SELECT id FROM evidence_bindings WHERE document_id=? AND active=1",
-            (scene_id,),
-        )
-    # Revision-box hints are derived routing data. The authored Scene now
-    # owns the material; retire stale hints without losing authored drafts.
-    if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='narrative_proposals'").fetchone():
-        for row in store.conn.execute(
-            "SELECT id,metadata_json FROM narrative_proposals WHERE status='pending'"
-        ).fetchall():
-            hint = json.loads(row["metadata_json"])
-            if (
-                event["id"] in hint.get("source_event_ids", [])
-                or hint.get("latest_material_type") == "event"
-                and hint.get("latest_material_id") == event["id"]
-                or hint.get("source_type") == "event"
-                and hint.get("source_id") == event["id"]
-            ):
-                hint.update(status="dismissed", resolution="event_promoted_to_scene", updated_at=now())
-                store.conn.execute(
-                    "UPDATE narrative_proposals SET status='dismissed',metadata_json=? WHERE id=?",
-                    (encode(hint), row["id"]),
-                )
-    store.conn.execute("INSERT INTO index_outbox(document_id) VALUES (?)", (scene_id,))
-    return {
-        "id": scene_id,
-        "kind": "scene",
-        "revision": scene["revision"],
-        "status": "saved",
-        "source_event_id": event["id"],
-        "event_surface": store.surface_state(event["id"]),
-    }
-
-
 class Writer:
     def __init__(self, database, *, favorite_policy=None, promotion_policy=None, diary_writer=None):
         # Writing tools cannot initialize a typo path or implicitly migrate a DB.
@@ -225,16 +139,47 @@ class Writer:
 
     def _promote_event(self, request):
         event = self._current(request["event_id"], request["expected_revision"])
-        return promote_event_in_store(
-            self.store,
-            event,
-            request["title"],
-            request["body_md"],
-            cues=request.get("cues"),
-            memory_value_source=request.get("memory_value_source") or "authored_scene",
-            write_contract=request.get("write_contract") or "event-to-scene-v1",
-            actor=request.get("actor") or "assistant",
-        )
+        if event["kind"] != "event" or event["lifecycle"] != "active":
+            raise Conflict("Only an active Event can become a Scene")
+        title, body = request["title"].strip(), request["body_md"].strip()
+        if not title or not body:
+            raise ValueError("Scene title and edited body are required")
+        bindings = self.store.conn.execute(
+            "SELECT source_id,metadata_json FROM evidence_bindings WHERE document_id=? AND active=1 ORDER BY id",
+            (event["id"],)).fetchall()
+        if not bindings:
+            raise ValueError("Event has no active original evidence to carry into the Scene")
+        scene_id = promoted_scene_id(event["id"])
+        if self.store.read(scene_id):
+            raise Conflict("This Event already has a promoted Scene; edit that Scene instead")
+        domain = event["metadata"].get("canonical_domain") or "general"
+        scene = self.store.create(scene_id, "scene", title, body,
+                                  metadata={"object_kind": "scene", "memory_value_source": "authored_scene",
+                                            "write_contract": "event-to-scene-v1", "scene_cues": [],
+                                            "canonical_domain": domain, "domain": [domain],
+                                            "date": event["metadata"].get("local_date") or "",
+                                            "created": now(), "promoted_from_event": {"id": event["id"],
+                                              "revision": event["revision"], "body_sha256": event["body_sha256"]}})
+        for binding in bindings:
+            self.store.bind(scene_id, binding["source_id"],
+                            metadata=json.loads(binding["metadata_json"]), actor="assistant")
+        if self.store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='scene_evidence_ids'").fetchone():
+            self.store.conn.execute("INSERT OR IGNORE INTO scene_evidence_ids(binding_id) "
+                                    "SELECT id FROM evidence_bindings WHERE document_id=? AND active=1", (scene_id,))
+        # Revision-box hints are derived routing data. The authored Scene now
+        # owns the material; retire stale hints without losing authored drafts.
+        if self.store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='narrative_proposals'").fetchone():
+            for row in self.store.conn.execute("SELECT id,metadata_json FROM narrative_proposals WHERE status='pending'").fetchall():
+                hint = json.loads(row["metadata_json"])
+                if (event["id"] in hint.get("source_event_ids", []) or
+                        hint.get("latest_material_type") == "event" and hint.get("latest_material_id") == event["id"] or
+                        hint.get("source_type") == "event" and hint.get("source_id") == event["id"]):
+                    hint.update(status="dismissed", resolution="event_promoted_to_scene", updated_at=now())
+                    self.store.conn.execute("UPDATE narrative_proposals SET status='dismissed',metadata_json=? WHERE id=?",
+                                            (encode(hint), row["id"]))
+        self._dirty(scene_id)
+        return {"id": scene_id, "kind": "scene", "revision": scene["revision"], "status": "saved",
+                "source_event_id": event["id"], "event_surface": self.store.surface_state(event["id"])}
 
     def _state(self, request):
         doc = self._current(request["document_id"], request["expected_revision"])

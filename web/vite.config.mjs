@@ -790,7 +790,7 @@ function sereinMemoryBridge() {
         response.setHeader("Content-Type","application/json; charset=utf-8");
         response.setHeader("Cache-Control","no-store");
         const action=request.url?.split("?")[0];
-        if(!(request.method==="GET" && (action==="/status" || /^\/attempts\/\d+$/.test(action))) && !(request.method==="POST" && ["/next","/submit","/rebuild","/retry-image","/retry-batch"].includes(action))) {
+        if(!(request.method==="GET" && (action==="/status" || /^\/attempts\/\d+$/.test(action))) && !(request.method==="POST" && ["/next","/submit","/rebuild","/retry-image","/retry-batch","/restore-auto-boundary"].includes(action))) {
           response.statusCode=405;response.end(JSON.stringify({error:"method_not_allowed"}));return;
         }
         if(request.method==="POST" && (!String(request.headers["content-type"]).startsWith("application/json") ||
@@ -810,7 +810,7 @@ function sereinMemoryBridge() {
         response.setHeader("Cache-Control","no-store");
         const path=request.url?.split("?")[0] || "/";
         if(!(request.method==="GET" && path==="/") && !(request.method==="POST" &&
-           (path==="/preview" || path==="/retry-tagging" || /^\/upload%3A[a-f0-9]{64}\/(continue|pause)$/i.test(path)))) {
+           (path==="/preview" || path==="/retry-tagging" || /^\/upload%3A[a-f0-9]{64}\/(continue|pause|include-in-events|summarize|skip-summary)$/i.test(path)))) {
           response.statusCode=405;response.end(JSON.stringify({error:"method_not_allowed"}));return;
         }
         if(request.method!=="GET" && (!String(request.headers["content-type"]).startsWith("application/json") ||

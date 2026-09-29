@@ -9,7 +9,7 @@ from ..deployment import identity, task_model, read_settings
 from .pipeline_limits import blocks, allowed_ids
 from ..compat.events import Events, reference_blockers
 from ..compat.germany.fact_events import FactEventStore
-from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units, fill_missing_existing_track_updates
+from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
 from . import pipeline_latest as latest
 from .pipeline_config import snapshot, execution
 from .pipeline_images import (freeze_task_images, persistable_request, hydrate_request_images,
@@ -44,6 +44,10 @@ class PausedBatch(ValueError):
     pass
 
 
+class RoutingRecoveryError(ValueError):
+    """A durable route cannot be proved safe to use for its frozen batch."""
+
+
 def parse_model_json(raw):
     """Parse a model JSON response, tolerating markdown fences and surrounding prose."""
     text = str(raw or '')
@@ -61,43 +65,42 @@ def parse_model_json(raw):
     return json.loads(text)
 
 
-class RoutingRecoveryError(ValueError):
-    """A durable route cannot be proved safe to use for its frozen batch."""
-
-
 def api_timeout_seconds(role, prompt_chars, configured):
-    base=max(30,int(configured))
-    if role=='event_writer' or (role=='track_router' and prompt_chars>=50000):
-        return min(1800,max(base,base*2))
+    base = max(30, int(configured))
+    if role == 'event_writer' or (role == 'track_router' and prompt_chars >= 50000):
+        return min(1800, max(base, base * 2))
     return base
 
 
 def api_prompt_for_model(request):
     """Compact an API-bound prompt without mutating the frozen request contract."""
-    prompt=str(request.get('prompt') or '')
-    rules=str(request.get('rules') or '')
-    duplicated_rules='\n\n'+rules+'\n\n'
+    prompt = str(request.get('prompt') or '')
+    rules = str(request.get('rules') or '')
+    duplicated_rules = '\n\n' + rules + '\n\n'
     if rules and duplicated_rules in prompt:
-        prompt=prompt.replace(duplicated_rules,'\n\n',1)
-    if request.get('role')!='event_writer':
+        prompt = prompt.replace(duplicated_rules, '\n\n', 1)
+    if request.get('role') != 'event_writer':
         return prompt
-    for tag in ('event_reading_block_json','materialized_track_cards_json','track_context_events_json','previous_events_json','curator_materials_json'):
-        pattern=re.compile(r'(<'+re.escape(tag)+r'>\n)(.*?)(\n</'+re.escape(tag)+r'>)',re.S)
-        match=pattern.search(prompt)
+    for tag in ('event_reading_block_json', 'materialized_track_cards_json', 'track_context_events_json', 'previous_events_json'):
+        pattern = re.compile(r'(<'+re.escape(tag)+r'>\n)(.*?)(\n</'+re.escape(tag)+r'>)', re.S)
+        match = pattern.search(prompt)
         if match is None:
             continue
         try:
-            payload=json.loads(match.group(2))
+            payload = json.loads(match.group(2))
         except json.JSONDecodeError:
             continue
-        if tag=='event_reading_block_json' and isinstance(payload,list):
-            payload=[{key:value for key,value in item.items()
-                      if key!='saved_snowflake'
-                      and not (key=='memory_event_source' and value is False)
-                      and not (key=='attachment_refs' and value==[])}
-                     if isinstance(item,dict) else item for item in payload]
-        compact=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
-        prompt=prompt[:match.start(2)]+compact+prompt[match.end(2):]
+        if tag == 'event_reading_block_json' and isinstance(payload, list):
+            payload = [
+                {key: value for key, value in item.items()
+                 if key != 'saved_snowflake'
+                 and not (key == 'memory_event_source' and value is False)
+                 and not (key == 'attachment_refs' and value == [])}
+                if isinstance(item, dict) else item
+                for item in payload
+            ]
+        compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        prompt = prompt[:match.start(2)] + compact + prompt[match.end(2):]
     return prompt
 
 
@@ -765,7 +768,28 @@ def request_for(database,batch,role,**fields):
     return request
 
 
+def prepare_stage_output(request, output):
+    if not isinstance(output, dict):
+        return output
+    if (request['role'] == 'event_writer' and set(output) == {'type', 'content'}
+            and output['type'] == 'json_object' and isinstance(output['content'], dict)):
+        output = output['content']
+    if request['role'] != 'track_router':
+        return output
+    top_fields = {'message_assignments', 'track_updates', '_splitter_provider',
+                  '_splitter_model', '_splitter_provider_index', '_codex_job'}
+    assignment_fields = {'source_message_id', 'primary_track_ref', 'context_track_refs', 'routing_role'}
+    update_fields = {'track_ref', 'subject', 'throughline', 'event_policy', 'status'}
+    prepared = {key: value for key, value in output.items() if key in top_fields}
+    for name, fields in (('message_assignments', assignment_fields), ('track_updates', update_fields)):
+        if isinstance(prepared.get(name), list):
+            prepared[name] = [({key: value for key, value in item.items() if key in fields}
+                               if isinstance(item, dict) else item) for item in prepared[name]]
+    return prepared
+
+
 def validate(request,output):
+    output=prepare_stage_output(request,output)
     if not isinstance(output,dict):raise ValueError('Stage output must be a JSON object')
     role=request['role']
     if role not in ROLES:raise ValueError('This pipeline stage is retired or unknown; request the next task')
@@ -779,7 +803,6 @@ def validate(request,output):
         return
     with latest.identity_scope(request['identity']):
         if role=='track_router':
-            fill_missing_existing_track_updates(output,request['active_tracks'])
             assignments,_,_=normalize_event_track_message_output(output,request['messages'],request['active_tracks'],session_id='validate',next_track_ordinal=1)
             routing_units(request['messages'],assignments)
         elif role=='event_curator':
@@ -789,7 +812,6 @@ def validate(request,output):
                 component['curator_image_transcriptions']=bound
             latest.normalize_event_curator_output(decision(output),component)
         else:
-            latest.normalize_event_writer_result(output)
             transcriptions:dict[int,list[str]]={}
             for item in request.get('curator_image_transcriptions') or []:
                 if item.get('evidence_role')=='owned' and type(item.get('source_message_id')) is int:
@@ -808,8 +830,45 @@ def record_attempt(database,job_id,output,error=''):
             (job_id,number,now(),output[:2_000_000],error[:1000]))
 
 
+def curator_omission_attempts(database,job_id):
+    with Store(database,read_only=True) as store:
+        return store.conn.execute(
+            "SELECT count(*) FROM pipeline_attempts WHERE job_id=? "
+            "AND id>COALESCE((SELECT max(id) FROM pipeline_attempts WHERE job_id=? AND error='curator_omission_retry_reset'),0) "
+            "AND error LIKE 'Track Curator accounting must exact-cover stable primary routing:%'",
+            (job_id,job_id)).fetchone()[0]
+
+
+def curator_repair_prompt(request, output, error):
+    missing=set(error.missing_source_ids)
+    messages=[item for item in request['component']['messages'] if int(item['id']) in missing]
+    return request['prompt']+'\n漏项修复：保留上一份结果中已有的有效归属和处置，对照完整上下文补全遗漏。必要时修正关联的边界和回执；不得为通过校验一律 skip/defer，不得猜测归属。返回修复后的完整 JSON，程序会重新检查全部来源、重复归属和冲突。\n'+encode({
+        'missing_source_message_ids':error.missing_source_ids,
+        'missing_messages':messages,
+        'previous_output':output})
+
+
+def pause_curator_repair(database,job_id,error):
+    # Exhausted repair is a failure of the frozen job, never a successful defer.
+    with Store(database) as store,store.transaction(immediate=True):
+        row=store.conn.execute('SELECT j.batch_id,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
+        if row is None or row['status'].startswith('superseded_'):
+            raise Conflict('Curator job changed before repair could be paused')
+        reason=f'Curator 漏项修复失败，遗漏原话 {error.missing_source_ids}；完整审阅材料已保留，请重试此批次'
+        result={'status':'paused','batch_id':row['batch_id'],'job_id':job_id,'reason':reason,
+                'curator_omission_source_message_ids':error.missing_source_ids}
+        store.conn.execute("UPDATE pipeline_batches SET status='paused_failure',result_json=? WHERE id=?",
+                           (encode(result),row['batch_id']))
+    raise PausedBatch(reason)
+
+
 def submit(database,job_id,output):
     try:return _submit(database,job_id,output)
+    except latest.CuratorCoverageError as error:
+        record_attempt(database,job_id,encode(output),str(error))
+        if curator_omission_attempts(database,job_id)<2:
+            raise
+        pause_curator_repair(database,job_id,error)
     except ValueError as error:
         record_attempt(database,job_id,encode(output),str(error))
         raise
@@ -817,9 +876,6 @@ def submit(database,job_id,output):
 
 def _submit(database,job_id,output):
     initialize(database)
-    if isinstance(output,dict) and 'claim_groups' in output:
-        latest.canonicalize_claim_group_ids(output)
-    encoded_output=encode(output)
     with Store(database,read_only=True) as store:
         row=store.conn.execute('SELECT j.*,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
         if row is None:raise ValueError('Unknown pipeline job')
@@ -827,6 +883,10 @@ def _submit(database,job_id,output):
     request=hydrate_request_images(database,row['batch_id'],json.loads(frozen_request))
     if request['role'] not in ROLES:
         raise ValueError('This pipeline stage is retired; request the next task')
+    output=prepare_stage_output(request,output)
+    if isinstance(output,dict) and 'claim_groups' in output:
+        latest.canonicalize_claim_group_ids(output)
+    encoded_output=encode(output)
     if status.startswith('superseded_'):raise ValueError('任务输入已更新，请重新领取任务；原话和已完成的归线仍保留')
     if existing_output:
         if existing_output!=encoded_output:raise Conflict('This job already has a different result')
@@ -880,9 +940,31 @@ def retry_batch(database,batch_id):
     with Store(database) as store,store.transaction(immediate=True):
         row=store.conn.execute('SELECT status FROM pipeline_batches WHERE id=?',(batch_id,)).fetchone()
         if row is None or row['status']!='paused_failure':raise ValueError('找不到暂停的批次')
+        # The synthetic reset marker belongs only to Curator omission repair.
+        # General stage retries already retain their real attempt history.
+        for job in store.conn.execute("SELECT id FROM pipeline_jobs WHERE batch_id=? "
+                                      "AND role='event_curator' AND output_json IS NULL",(batch_id,)):
+            number=store.conn.execute('SELECT count(*) FROM pipeline_attempts WHERE job_id=?',(job['id'],)).fetchone()[0]+1
+            store.conn.execute('INSERT INTO pipeline_attempts(job_id,attempt,created_at,output_text,error) VALUES (?,?,?,?,?)',
+                               (job['id'],number,now(),'','curator_omission_retry_reset'))
         store.conn.execute('DELETE FROM pipeline_job_failures WHERE job_id IN (SELECT id FROM pipeline_jobs WHERE batch_id=? AND output_json IS NULL)',(batch_id,))
         store.conn.execute("UPDATE pipeline_batches SET status='pending',result_json=NULL WHERE id=?",(batch_id,))
     return {'status':'resumed','batch_id':batch_id}
+
+
+def restore_auto_boundary(database,confirm):
+    if confirm!='RESTORE_AUTO_BOUNDARY':
+        raise ValueError('请先确认恢复自动边界外的原话')
+    with Store(database) as store,store.transaction(immediate=True):
+        if not store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='raw_processing'").fetchone():
+            return {'status':'restored','restored_originals':0}
+        count=store.conn.execute("SELECT count(*) FROM raw_processing WHERE outcome='auto_boundary'").fetchone()[0]
+        store.conn.execute("DELETE FROM raw_processing WHERE outcome='auto_boundary'")
+        if count:
+            store.conn.execute("INSERT INTO background_state(name,value_json) VALUES ('pipeline_auto_boundary_restore',?) "
+                               "ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json",
+                               (encode({'restored_originals':count,'restored_at':now()}),))
+    return {'status':'restored','restored_originals':count}
 
 
 async def job(database,batch,request,key,runner):
@@ -909,8 +991,7 @@ async def job(database,batch,request,key,runner):
     model=config['models'].get(request.get('execution',{}).get('task',request['role'])) if policy['execution_mode']!='agent' else None
     if model is None and request.get('transcription_only') and policy['execution_mode']!='agent':
         model=config['models'].get('event_curator')
-    prompt=request['prompt']
-    api_prompt=api_prompt_for_model(request) if model else prompt
+    api_prompt=api_prompt_for_model(request) if model else request['prompt']
     prompt_chars=len(api_prompt)+len(request['rules'])
     request_timeout=api_timeout_seconds(request['role'],prompt_chars,policy['timeout_seconds'])
     progress(prompt_chars=prompt_chars,timeout_seconds=request_timeout)
@@ -968,7 +1049,7 @@ async def job(database,batch,request,key,runner):
                         if reasoning_tokens is not None:
                             suffix+=f'，其中思考使用 {reasoning_tokens} tokens'
                     raise ValueError('模型未返回最终 JSON 内容'+suffix)
-                output=parse_model_json(raw)
+                output=prepare_stage_output(request,parse_model_json(raw))
                 validate(request,output)
                 record_attempt(database,identifier,raw)
                 break
@@ -977,7 +1058,16 @@ async def job(database,batch,request,key,runner):
                 reason=failure_reason(error)
                 record_attempt(database,identifier,raw,reason)
                 progress(error=reason,attempt=attempt+1)
-                if image:record_image_failure(database,image,error)
+                if isinstance(error,latest.CuratorCoverageError):
+                    if curator_omission_attempts(database,identifier)>=2:
+                        pause_curator_repair(database,identifier,error)
+                    prompt=curator_repair_prompt(request,output,error)
+                    if len(prompt)+len(request['rules'])>policy['max_prompt_chars']:
+                        pause_curator_repair(database,identifier,error)
+                    if attempt==attempts-1:
+                        pause_curator_repair(database,identifier,error)
+                    continue
+                elif image:record_image_failure(database,image,error)
                 else:fail_stage(database,batch,identifier,error)
                 if (not image and (not received or not isinstance(error,ValueError))) or attempt==attempts-1:raise
                 correction='\n请按原角色规则纠正结构或证据校验错误，只返回完整 JSON。保留人物归属、比喻及不确定程度，不按词句数量改写文风。编号使用原始编号，不得按展示位置重新编号。\n'+encode({'validation_error':reason,'allowed_ids':allowed_ids(request)})
@@ -985,7 +1075,24 @@ async def job(database,batch,request,key,runner):
                 if room<0:raise ValueError('提示词上限不足以容纳纠错请求，请减小每批输入。') from error
                 prompt=request['prompt']+correction+'\n上一份不合格输出（仅用于纠错，可能截断）：\n'+raw[:min(room,10000)]
         progress(error='')
-    try:submit(database,identifier,output)
+    output=prepare_stage_output(request,output)
+    try:
+        accepted=submit(database,identifier,output)
+    except latest.CuratorCoverageError as error:
+        if runner is None:
+            raise
+        retry_request={**request,'prompt':curator_repair_prompt(request,output,error)}
+        if len(retry_request['prompt'])+len(request['rules'])>policy['max_prompt_chars']:
+            pause_curator_repair(database,identifier,error)
+        try:
+            output=prepare_stage_output(request,await runner(request['role'],retry_request))
+            accepted=submit(database,identifier,output)
+        except PausedBatch:
+            raise
+        except Exception as retry_error:
+            if not isinstance(retry_error,latest.CuratorCoverageError):
+                fail_stage(database,batch,identifier,retry_error)
+            raise
     except Exception as error:
         if not image:fail_stage(database,batch,identifier,error)
         raise

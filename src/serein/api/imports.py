@@ -24,6 +24,9 @@ def routes(settings,auth):
         entries=list_imports(settings.database)
         for entry in entries:
             entry['task']=status(settings.database,'import:'+entry['id'])
+            with Store(settings.database,read_only=True) as store:
+                choice=store.conn.execute('SELECT value_json FROM background_state WHERE name=?',('import-choice:'+entry['id'],)).fetchone()
+            entry['summary_choice']=json.loads(choice[0])['choice'] if choice else None
         with Store(settings.database,read_only=True) as store:
             tags={row['status']:row['n'] for row in store.conn.execute('SELECT status,COUNT(*) n FROM import_tag_jobs GROUP BY status')}
             failures=[dict(row) for row in store.conn.execute("SELECT document_id,error FROM import_tag_jobs WHERE status='failed' LIMIT 20")]
@@ -48,14 +51,37 @@ def routes(settings,auth):
     def include_in_events(identifier:str):
         return release_imported_originals(settings.database,identifier)
 
+    @router.post('/v1/imports/{identifier}/summarize')
+    def summarize_import(identifier:str):
+        receipt=release_imported_originals(settings.database,identifier)
+        if receipt['originals']:
+            receipt['task']=enqueue(settings.database,'pipeline',{'include_recent':True},followup_if_running=True)
+        return receipt
+
+    @router.post('/v1/imports/{identifier}/skip-summary')
+    def skip_import_summary(identifier:str):
+        return release_imported_originals(settings.database,identifier,skip=True)
+
     @router.get('/v1/pipeline/status')
     def pipeline_status():
         value=status(settings.database,'pipeline')
+        from ..deployment import read_settings, configured_models
+        config=read_settings(settings.database)
+        value['execution_mode']=config['pipeline']['execution_mode']
+        if value['execution_mode']!='agent':
+            known={item['id'] for item in configured_models(config)}
+            value['unassigned_roles']=[role for role in ('track_router','event_curator','event_writer')
+                                       if config['assignments'].get(role) not in known]
+        else:
+            value['unassigned_roles']=[]
         from ..image_transcription import initialize_failures
         with Store(settings.database) as store:initialize_failures(store.conn)
         if value.get('stage')=='event_evidence':
             value.update(status='idle',stage='idle',result=None,job_id='',error='旧证据整理阶段已撤掉，继续整理会进入下一阶段。')
         with Store(settings.database,read_only=True) as store:
+            value['auto_boundary_originals']=(store.conn.execute(
+                "SELECT count(*) FROM raw_processing WHERE outcome='auto_boundary'").fetchone()[0]
+                if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='raw_processing'").fetchone() else 0)
             if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='pipeline_batches'").fetchone():
                 value['paused_batches']=[json.loads(row[0]) for row in store.conn.execute("SELECT result_json FROM pipeline_batches WHERE status='paused_failure' ORDER BY rowid")]
             value['failed_images']=[dict(row) for row in store.conn.execute(
@@ -83,6 +109,13 @@ def routes(settings,auth):
         from ..extensions.pipeline import retry_batch
         async def retry():return retry_batch(settings.database,body.get('batch_id'))
         return await execute(settings.database,'pipeline',retry)
+
+    @router.post('/v1/pipeline/restore-auto-boundary')
+    async def restore_pipeline_auto_boundary(body:dict):
+        from ..work_tasks import execute
+        from ..extensions.pipeline import restore_auto_boundary
+        async def restore():return restore_auto_boundary(settings.database,body.get('confirm'))
+        return await execute(settings.database,'pipeline',restore)
 
     @router.post('/v1/pipeline/retry-image')
     async def retry_image(body:dict):

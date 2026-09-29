@@ -234,6 +234,14 @@ test('gateway separates web auth from API auth, saves settings and streams respo
     assert.equal((await fetch(base+'/__serein/pipeline/retry-batch',{method:'POST',headers:{...postHeaders,Origin:'https://foreign.invalid'},body:JSON.stringify(batchRetry)})).status,403);
     assert.equal((await fetch(base+'/__serein/pipeline/retry-image',{method:'POST',headers:{...postHeaders,Origin:'https://foreign.invalid'},body:JSON.stringify(imageRetry)})).status,403);
     const upload='upload%3A'+'a'.repeat(64);
+    for (const action of ['summarize','skip-summary','include-in-events']) {
+      const path='/__serein/imports/'+upload+'/'+action;
+      assert.equal((await fetch(base+path,{method:'POST',headers:postHeaders,body:'{}'})).status,200);
+      assert.ok(requests.some(r=>r.path==='/v1/imports/'+upload+'/'+action&&r.method==='POST'&&r.auth==='Bearer synthetic-api-key'));
+      assert.equal((await fetch(base+path,{method:'POST',headers:{...postHeaders,Origin:'https://foreign.invalid'},body:'{}'})).status,403);
+      assert.equal((await fetch(base+path,{headers:auth})).status,405);
+    }
+
     for(const action of ['continue','pause'])assert.equal((await fetch(base+'/__serein/imports/'+upload+'/'+action,{method:'POST',headers:postHeaders,body:'{}'})).status,200);
     assert.equal((await fetch(base+'/v1/models',{headers:auth})).status,401);
     assert.equal((await fetch(base+'/v1/models',{headers:{Authorization:'Bearer wrong'}})).status,401);

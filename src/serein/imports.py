@@ -222,8 +222,8 @@ def archive_imported_originals(conn, upload_id=None):
             (str(upload_id),str(upload_id)))
 
 
-def release_imported_originals(database, upload_id):
-    """Opt one completed conversation import back into automatic Event processing."""
+def release_imported_originals(database, upload_id, *, skip=False):
+    """Choose whether a completed conversation import enters Event processing."""
     identifier=str(upload_id or '').strip()
     if not identifier:
         raise ValueError('导入任务 ID 不能为空')
@@ -237,6 +237,14 @@ def release_imported_originals(database, upload_id):
         if int(row['cursor'])!=int(row['total']):
             raise ValueError('请先完成这份聊天记录的导入')
         originals=store.conn.execute("SELECT count(*) FROM raw_events WHERE json_extract(metadata_json,'$.import_upload_id')=?",(identifier,)).fetchone()[0]
+        if skip:
+            boundary=store.conn.execute('SELECT released FROM pipeline_import_boundaries WHERE upload_id=?',(identifier,)).fetchone()
+            if originals and (boundary is None or boundary['released']):
+                raise ValueError('这份原话已加入整理，不能再跳过；请在摘要配置中查看任务。')
+            store.conn.execute("INSERT INTO background_state(name,value_json) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json",
+                               ('import-choice:'+identifier,json.dumps({'choice':'skip'})))
+            return {'status':'skipped','upload_id':identifier,'originals':int(originals or 0)}
+        store.conn.execute('DELETE FROM background_state WHERE name=?',('import-choice:'+identifier,))
         released=store.conn.execute('UPDATE pipeline_import_boundaries SET released=1 WHERE upload_id=? AND released=0',(identifier,)).rowcount
     return {'status':'released' if released else 'unchanged','upload_id':identifier,
             'originals':int(originals or 0),'released':bool(released)}

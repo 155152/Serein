@@ -220,7 +220,7 @@ export function UsageGuide({ onOpenSettingsTab, initialPage }) {
     </section>
     <section className="settings-group usage-guide__page" {...page(8)}>
       <div className="settings-group__heading"><h3>自动 Event 会调用哪些模型</h3><p>开关允许后台处理后续新聊天，不等于打开时立刻调用，也不是每轮固定三次。</p></div>
-      <p>聊天完整成功后，用户和助手原话先进入档案；这一步不调用整理模型。文件导入和旧库迁移的历史原话默认只归档；聊天文件导入完成后可明确点击“把这份历史加入 Event 整理”，不会因打开自动摘要自动补跑。</p>
+      <p>聊天完整成功后，用户和助手原话先进入档案；这一步不调用整理模型。文件导入和旧库迁移的历史原话默认只归档；聊天文件导入完成后可选择“立即从头摘要（后台）”，无需开启自动摘要；或选择“暂不处理，并推游标到最后一句”，只跳过这份导入。不会因打开自动摘要自动补跑。</p>
       <ol>
         <li><strong>归线（Track Router）</strong>：白天同一会话累计至少五个已完成回复包，并有二十分钟停顿后，按批调用归线模型；只记录话题归属，不写 Event。若白天未归线，凌晨结算时仍可能先调用它。</li>
         <li><strong>切分（Curator）</strong>：上海时间凌晨三点后，判断 Track 材料中哪些经历构成 Event、哪些跳过或暂缓。图片先通过独立任务逐张转录；未选图片模型时用切分模型转录，仍需视觉能力。</li>
