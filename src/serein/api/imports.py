@@ -24,6 +24,9 @@ def routes(settings,auth):
         entries=list_imports(settings.database)
         for entry in entries:
             entry['task']=status(settings.database,'import:'+entry['id'])
+            with Store(settings.database,read_only=True) as store:
+                choice=store.conn.execute('SELECT value_json FROM background_state WHERE name=?',('import-choice:'+entry['id'],)).fetchone()
+            entry['summary_choice']=json.loads(choice[0])['choice'] if choice else None
         with Store(settings.database,read_only=True) as store:
             tags={row['status']:row['n'] for row in store.conn.execute('SELECT status,COUNT(*) n FROM import_tag_jobs GROUP BY status')}
             failures=[dict(row) for row in store.conn.execute("SELECT document_id,error FROM import_tag_jobs WHERE status='failed' LIMIT 20")]
@@ -47,6 +50,17 @@ def routes(settings,auth):
     @router.post('/v1/imports/{identifier}/include-in-events')
     def include_in_events(identifier:str):
         return release_imported_originals(settings.database,identifier)
+
+    @router.post('/v1/imports/{identifier}/summarize')
+    def summarize_import(identifier:str):
+        receipt=release_imported_originals(settings.database,identifier)
+        if receipt['originals']:
+            receipt['task']=enqueue(settings.database,'pipeline',{'include_recent':True},followup_if_running=True)
+        return receipt
+
+    @router.post('/v1/imports/{identifier}/skip-summary')
+    def skip_import_summary(identifier:str):
+        return release_imported_originals(settings.database,identifier,skip=True)
 
     @router.get('/v1/pipeline/status')
     def pipeline_status():
