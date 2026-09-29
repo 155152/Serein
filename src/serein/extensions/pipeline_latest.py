@@ -196,6 +196,7 @@ def build_event_track_curator_prompt(date_view: str, component: dict[str, Any], 
             'dispositions 每项格式：'+json.dumps({'disposition':'skip','unit_roots':[5],'reason':'处置依据','parked_source_message_ids':[]},ensure_ascii=False)+'；disposition 只能为 skip 或 defer；defer 必须引用真实 parked source ID；没有 skip/defer 时返回 []。\n'
             f'{json.dumps(format_hint, ensure_ascii=False)}\n\n'
             '只选择 scope=stable 的完整 unit。每个 stable unit 必须恰好进入 Event、skip 或 defer；只有 Router 声明的 bridge 可共享。'
+            'scope=stable 的 foreign-primary bridge 也属于本 corridor 的 exact-cover：若它仍承担当前 Track 的回应、纠正、收尾或转场，就作为 bridge 纳入相应 Event；若它只是在开启另一 Track，则明确放入 skip_unit_roots。不得因为 primary_track 不同就静默遗漏。'
             'parked/context_only 只可阅读。extend/merge 只填写 base_event_ids，host 取原文并集。'
             'parked 直接纠正紧邻 stable 结果时 defer；无关 parked 不影响已落定材料。'
             'rolling_engineering 逐条核对实际建设，相关 base 全选；受保护前版仍拟议 extend/merge，由 host 按冻结配置检查能否原文后追加，否则暂缓。\n'
@@ -554,8 +555,14 @@ def _normalize_expanded_event_curator_output(output: dict[str, Any], component: 
     owned_stable_ids = set(owners_by_source).intersection(stable_ids)
     if owned_stable_ids.intersection(skip) or owned_stable_ids.intersection(defer) or set(skip).intersection(defer):
         raise ValueError('Track Curator accounting dispositions must be disjoint')
-    if owned_stable_ids.union(skip).union(defer) != stable_ids:
-        raise ValueError('Track Curator accounting must exact-cover stable primary routing')
+    accounted_stable_ids = owned_stable_ids.union(skip).union(defer)
+    if accounted_stable_ids != stable_ids:
+        missing = [source_id for source_id in stable_order if source_id not in accounted_stable_ids]
+        raise ValueError(
+            'Track Curator accounting must exact-cover stable primary routing; '
+            f'omitted stable source ids: {missing}. Every stable source, including a foreign-primary declared bridge, '
+            'must enter Event, skip, or defer.'
+        )
     for track_id, event_policy in event_policy_by_track.items():
         if event_policy != 'rolling_engineering':
             continue

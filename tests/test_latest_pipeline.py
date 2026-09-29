@@ -39,6 +39,44 @@ def test_parked_correction_is_readable_but_not_owned(settings):
     assert len(latest.normalize_event_curator_output(deferred,component)['defer_source_message_ids'])==2
 
 
+def test_foreign_primary_stable_bridge_must_be_explicitly_accounted():
+    messages=[
+        {'id':1,'session_id':1,'role':'user','content':'keep talking about the old activity','created_at':'2026-09-28T07:00:00+00:00','metadata':{}},
+        {'id':2,'session_id':1,'role':'assistant','content':'close the old activity and open the new one','created_at':'2026-09-28T07:01:00+00:00','metadata':{}},
+    ]
+    component={
+        'track_ids':['track-a'],
+        'track_cards':[{'track_id':'track-a','subject':'old activity','throughline':'continue it','event_policy':'default'}],
+        'messages':messages,
+        'context_messages':messages,
+        'parked_context_source_ids':[],
+        'memberships':[
+            {'unit_root_message_id':1,'source_message_ids':[1],'track_id':'track-a','session_id':1,'routing_role':'primary_activity'},
+            {'unit_root_message_id':2,'source_message_ids':[2],'track_id':'track-b','session_id':1,'routing_role':'bridge'},
+        ],
+        'context_edges':[{'unit_root_message_id':2,'track_id':'track-a','relation':'bridge'}],
+        'base_event_candidates':[],
+        'context_session_ids':[1],
+        'writer_material_review':False,
+        'writer_round_gate':False,
+        'append_protected':False,
+    }
+    prompt=latest.build_event_track_curator_prompt('2026-09-28',component)
+    assert 'foreign-primary bridge' in prompt
+    output={
+        'events':[{'action':'create','base_event_ids':[],'primary_track_id':'track-a','owned_unit_roots':[1]}],
+        'skip_unit_roots':[],
+        'defer_unit_roots':[],
+        'decision_review':{'events':[{'event_index':0,'reason':'the first unit is the old activity'}],
+                           'boundaries':[],'dispositions':[]},
+    }
+    with pytest.raises(ValueError,match=r'omitted stable source ids: \[2\]'):
+        latest.normalize_event_curator_output(output,component)
+    output['events'][0]['owned_unit_roots'].append(2)
+    normalized=latest.normalize_event_curator_output(output,component)
+    assert normalized['events'][0]['source_bindings'][-1]=={'source_message_id':2,'activity_role':'bridge'}
+
+
 def test_latest_rolling_policy_does_not_force_unrelated_leaves_and_defers_blockers(settings):
     ingest(settings);asyncio.run(p.advance(settings.database,include_recent=True,runner=synthetic_runner));ingest(settings,2)
     task=curator_task(settings);component=copy.deepcopy(task['request']['component'])
