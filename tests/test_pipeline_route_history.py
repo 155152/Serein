@@ -370,6 +370,76 @@ def test_rebuild_preserves_published_events_other_caches_and_queue_priority(sett
         assert [tuple(r) for r in store.conn.execute('SELECT * FROM pipeline_routes')] == routes
 
 
+def test_settlement_publishes_provenance_only_for_stable_messages(settings):
+    from serein.compat.raw_archive import raw_archive
+    from serein.deployment import save_settings
+    raw_archive(settings).ingest([
+        {'source_event_id':'u1','session_id':'parked-ownership','role':'user','text':'u'*40,'created_at':'2025-01-01T00:00:00Z'},
+        {'source_event_id':'a1','session_id':'parked-ownership','role':'assistant','text':'a'*40,'created_at':'2025-01-01T00:01:00Z'},
+        {'source_event_id':'u2','session_id':'parked-ownership','role':'user','text':'v'*80,'created_at':'2025-01-01T00:02:00Z'},
+    ], source='test')
+    save_settings(settings.database, {'pipeline': {'max_input_chars': 100}})
+    p.initialize(settings.database)
+    batch = p.new_batch(settings.database, True)
+    frozen = json.loads(batch['input_json'])
+    assert [m['id'] for m in frozen['messages']] == [1, 2]
+    assert [m['id'] for m in frozen['parked']] == [3]
+    result = asyncio.run(p.advance(settings.database, include_recent=True, runner=synthetic_runner))
+    assert result['processed_originals'] == 2
+    with Store(settings.database, read_only=True) as store:
+        links = list(store.conn.execute('SELECT raw_id,batch_id FROM pipeline_route_provenance ORDER BY raw_id'))
+        assert [(row['raw_id'], row['batch_id']) for row in links] == [(1, batch['id']), (2, batch['id'])]
+        assert store.conn.execute('SELECT route_json FROM pipeline_routes WHERE raw_id=3').fetchone() is None
+
+
+def test_settlement_boundary_does_not_slice_recorded_router_frame(settings):
+    from serein.compat.raw_archive import raw_archive
+    from serein.deployment import save_settings
+    raw_archive(settings).ingest([
+        {'source_event_id':'u1','session_id':'frame-boundary','role':'user','text':'u'*40,'created_at':'2025-01-01T00:00:00Z'},
+        {'source_event_id':'a1','session_id':'frame-boundary','role':'assistant','text':'a'*40,'created_at':'2025-01-01T00:01:00Z'},
+        {'source_event_id':'u2','session_id':'frame-boundary','role':'user','text':'v'*40,'created_at':'2025-01-01T00:02:00Z'},
+        {'source_event_id':'a2','session_id':'frame-boundary','role':'assistant','text':'b'*40,'created_at':'2025-01-01T00:03:00Z'},
+        {'source_event_id':'u3','session_id':'frame-boundary','role':'user','text':'w'*40,'created_at':'2025-01-01T00:04:00Z'},
+        {'source_event_id':'a3','session_id':'frame-boundary','role':'assistant','text':'c'*40,'created_at':'2025-01-01T00:05:00Z'},
+    ], source='test')
+    save_settings(settings.database, {'pipeline': {'max_input_chars': 160}})
+    p.initialize(settings.database)
+    with Store(settings.database, read_only=True) as store:
+        messages = [p.task_message(row) for row in store.conn.execute('SELECT * FROM raw_events ORDER BY id')]
+    scope = p.track_state.scope_for(messages[0]['source'], messages[0]['original_session_id'])
+    producer_data = {
+        'contract': p.CONTRACT,
+        'runtime_revision': p.runtime_revision(),
+        'routing_messages': messages[2:6],
+        'tracks': [],
+        'next_track_ordinal': 1,
+        'scope': scope,
+        'recent': messages[:2],
+        'day': '2025-01-01',
+    }
+    producer = {'id': 'route:frame-boundary', 'scope': scope, 'input_json': encode(producer_data)}
+    with Store(settings.database) as store:
+        store.conn.execute("INSERT INTO pipeline_batches(id,scope,input_json,status) VALUES (?,?,?,'routing_only')",
+                           (producer['id'], scope, producer['input_json']))
+    routed = asyncio.run(p.route_batch(settings.database, producer, producer_data, synthetic_runner))
+    producer_data['routing_result'] = routed
+    with Store(settings.database) as store, store.transaction(immediate=True):
+        p.track_state.persist(store.conn, routed['track_state_updates'], scope)
+        recovery.record_routes(store.conn, producer['id'], routed['assignments'])
+        store.conn.execute("UPDATE pipeline_batches SET status='routed',input_json=? WHERE id=?",
+                           (encode(producer_data), producer['id']))
+    aligned, stable, parked = p._align_settlement_route_frames(
+        settings.database, messages[2:4], messages[2:4], messages[2:6], {3, 4, 5, 6})
+    assert [m['id'] for m in aligned] == [3, 4, 5, 6]
+    assert [m['id'] for m in stable] == [3, 4, 5, 6]
+    assert parked == []
+    batch = p.new_batch(settings.database, True)
+    frozen = json.loads(batch['input_json'])
+    assert [m['id'] for m in frozen['messages']] == [1, 2]
+    assert [m['id'] for m in frozen['routing_messages']] == [1, 2]
+
+
 def test_daily_flush_saves_producer_snapshot_and_route_provenance(settings, monkeypatch):
     from test_pipeline_limits import pairs
     from serein.compat.raw_archive import raw_archive

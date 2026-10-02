@@ -99,6 +99,40 @@ def _frames(database, batch):
     return frames
 
 
+def recorded_route_frame(database, raw_id):
+    """Return the exact accepted producer frame for one explicitly-provenanced raw.
+
+    This is a planning hint only. If the producer cannot be replayed exactly,
+    return None and leave the normal recovery path to fail closed later.
+    """
+    with Store(database, read_only=True) as store:
+        provenance = store.conn.execute(
+            'SELECT * FROM pipeline_route_provenance WHERE raw_id=?', (raw_id,)).fetchone()
+        if provenance is None:
+            return None
+        batch = store.conn.execute('SELECT * FROM pipeline_batches WHERE id=?',
+                                   (provenance['batch_id'],)).fetchone()
+        if batch is None or batch['status'] not in SOURCE_STATES:
+            return None
+        batch = dict(batch)
+        route_json = provenance['route_json']
+    try:
+        frames = _frames(database, batch)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    matches = []
+    for frame in frames:
+        ids = [m['id'] for m in frame['messages']]
+        if raw_id not in ids:
+            continue
+        assignment = next((a for a in frame['assignments']
+                           if a['source_message_id'] == raw_id), None)
+        if assignment is None or encode(assignment) != route_json:
+            continue
+        matches.append(frame)
+    return matches[0] if len(matches) == 1 else None
+
+
 def recover_cached_routes(database, data, assignments):
     """Return a fully proved historical result, or None for legacy cache fallback.
 

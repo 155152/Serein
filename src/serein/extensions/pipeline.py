@@ -217,6 +217,57 @@ def rules(role,database):
     with latest.identity_scope(identity(database)):return latest.materialize_agent_rules(role)
 
 
+def _align_settlement_route_frames(database, material, stable, eligible_rows, ready_ids):
+    """Keep a fresh settlement boundary from slicing an accepted Router frame.
+
+    Explicit route provenance is reusable only as the exact producer frame that
+    generated its Track state. Parked/read-only context may be trimmed freely;
+    stable ownership is trimmed to the previous frame, or expanded to one exact
+    frame when that frame starts the batch and is fully ready.
+    """
+    if not material or not stable:
+        return material,stable,[m for m in material if m not in stable]
+    from .pipeline_recovery import recorded_route_frame
+    by_id={m['id']:m for m in eligible_rows}
+
+    def frame_ids(raw_id):
+        frame=recorded_route_frame(database,raw_id)
+        if frame is None:return None
+        ids=[m['id'] for m in frame['messages']]
+        return ids if ids==sorted(ids) else None
+
+    stable_end=stable[-1]['id']
+    tail=frame_ids(material[-1]['id'])
+    if tail and tail[-1]>material[-1]['id'] and tail[0]>stable_end:
+        # Read-only context must never force recovery of a partial future frame.
+        material=[m for m in material if m['id']<tail[0]]
+    if not material:
+        return [],[],[]
+    stable=[m for m in material if m['id'] in ready_ids]
+    if not stable:
+        return material,[],list(material)
+
+    boundary=frame_ids(stable[-1]['id'])
+    if boundary and boundary[-1]>stable[-1]['id']:
+        start=boundary[0]
+        if start>material[0]['id']:
+            # Settle the complete prefix before the recorded Router frame.
+            material=[m for m in material if m['id']<start]
+        elif start==material[0]['id']:
+            # If the exact producer frame is fully eligible and settled-ready,
+            # use it whole even when a newly-phased soft chunk would cut it.
+            if all(key in by_id and key in ready_ids for key in boundary):
+                material=[by_id[key] for key in boundary]
+            else:
+                material=[]
+        # start < material[0] is a legacy split-provenance state. Leave it to
+        # the existing fail-closed recovery/rebuild path rather than guessing.
+    stable=[m for m in material if m['id'] in ready_ids]
+    stable_ids={m['id'] for m in stable}
+    parked=[m for m in material if m['id'] not in stable_ids]
+    return material,stable,parked
+
+
 def new_batch(database,include_recent,clock=None):
     policy=read_settings(database)['pipeline']
     current=(clock or datetime.now(timezone.utc)).astimezone(TZ)
@@ -281,8 +332,12 @@ def new_batch(database,include_recent,clock=None):
         for source,session in scopes:
             if digest(encode([source,session]))[:20] in held_scopes:continue
             rows=[task_message(row) for row in store.conn.execute('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id',(source,session))]
-            eligible=[r for r in rows if datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))<=watermark]
-            chunks=blocks(eligible,policy['max_input_chars'])
+            eligible_rows=[r for r in rows if datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))<=watermark]
+            ready_ids=set()
+            for unit in dialogue_units(eligible_rows):
+                ready=dialogue_unit_is_complete(unit) and (include_recent or datetime.fromisoformat(unit[-1]['created_at'].replace('Z','+00:00'))<=cutoff)
+                if ready:ready_ids.update(m['id'] for m in unit)
+            chunks=blocks(eligible_rows,policy['max_input_chars'])
             for chunk_index,eligible in enumerate(chunks):
                 if chunk_index+1<len(chunks):
                     following=dialogue_units(chunks[chunk_index+1])[0]
@@ -294,6 +349,8 @@ def new_batch(database,include_recent,clock=None):
                 for unit in dialogue_units(eligible):
                     ready=dialogue_unit_is_complete(unit) and (include_recent or datetime.fromisoformat(unit[-1]['created_at'].replace('Z','+00:00'))<=cutoff)
                     (stable if ready else parked).extend(unit)
+                eligible,stable,parked=_align_settlement_route_frames(
+                    database,eligible,stable,eligible_rows,ready_ids)
                 if not stable:continue
                 scope=digest(encode([source,session]))[:20]
                 with latest.identity_scope(identity(database)):
@@ -1178,7 +1235,8 @@ def settle(database,batch,data,routed,plans):
     encoded_result=encode(result)
     def finish(conn):
         from .pipeline_recovery import record_routes
-        record_routes(conn,batch['id'],assignments)
+        stable_ids={m['id'] for m in data['messages']}
+        record_routes(conn,batch['id'],[a for a in assignments if a['source_message_id'] in stable_ids])
         for item,detail in zip(items,details):
             key=conn.execute('SELECT item_id FROM fact_events WHERE origin_id=?',(item['origin_id'],)).fetchone()[0]
             conn.execute('INSERT OR IGNORE INTO pipeline_track_events VALUES (?,?)',(detail['track_id'],key))
