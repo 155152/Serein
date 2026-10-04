@@ -476,6 +476,78 @@ def test_legacy_116_originals_eleven_router_jobs_resume_without_repeating_them(s
         assert store.conn.execute('SELECT output_json FROM pipeline_jobs WHERE id=?',('legacy-curator',)).fetchone()[0] is None
 
 
+def test_scheduled_pipeline_never_marks_paused_scope_settled_today(settings,monkeypatch):
+    p.initialize(settings.database)
+    day='2025-01-02'
+    result={'status':'paused','batch_id':'paused-batch','reason':'synthetic curator omission'}
+    with Store(settings.database) as store:
+        frozen={'contract':p.CONTRACT,'runtime_revision':p.runtime_revision(),'scope':'scope','routing_messages':[]}
+        store.conn.execute("INSERT INTO pipeline_batches(id,scope,input_json,status,result_json) VALUES (?,?,?,'paused_failure',?)",
+                           ('paused-batch','scope',encode(frozen),encode(result)))
+        store.conn.execute('INSERT INTO pipeline_schedule VALUES (?,1)',(day,))
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return datetime(2025,1,2,4,tzinfo=p.TZ)
+    async def quiet_routes(*args,**kwargs):return None
+    monkeypatch.setattr(p,'datetime',FixedDateTime)
+    monkeypatch.setattr(p,'flush_routes',quiet_routes)
+    assert asyncio.run(p._scheduled_advance(settings.database))==result
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT completed FROM pipeline_schedule WHERE day=?',(day,)).fetchone() is None
+
+
+def test_scheduled_pipeline_rechecks_pause_before_marking_current(settings,monkeypatch):
+    p.initialize(settings.database)
+    day='2025-01-02'
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return datetime(2025,1,2,4,tzinfo=p.TZ)
+    async def quiet_routes(*args,**kwargs):return None
+    async def pause_then_current(*args,**kwargs):
+        frozen={'contract':p.CONTRACT,'runtime_revision':p.runtime_revision(),'scope':'scope','routing_messages':[]}
+        result={'status':'paused','batch_id':'paused-during-tick','reason':'synthetic pause'}
+        with Store(settings.database) as store:
+            store.conn.execute("INSERT INTO pipeline_batches(id,scope,input_json,status,result_json) VALUES (?,?,?,'paused_failure',?)",
+                               ('paused-during-tick','scope',encode(frozen),encode(result)))
+        return {'status':'current','note':'other scopes are current'}
+    monkeypatch.setattr(p,'datetime',FixedDateTime)
+    monkeypatch.setattr(p,'flush_routes',quiet_routes)
+    monkeypatch.setattr(p,'_advance',pause_then_current)
+    result=asyncio.run(p._scheduled_advance(settings.database))
+    assert result=={'status':'paused','batch_id':'paused-during-tick','reason':'synthetic pause'}
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT completed FROM pipeline_schedule WHERE day=?',(day,)).fetchone() is None
+
+
+def test_scheduled_pipeline_reopens_stale_completed_day_when_backlog_exists(settings,monkeypatch):
+    p.initialize(settings.database)
+    from serein.compat.raw_archive import raw_archive
+    raw_archive(settings).ingest([
+        {'source_event_id':'u-stale','session_id':'stale','role':'user','text':'hello','created_at':'2025-01-01T00:00:00Z'},
+        {'source_event_id':'a-stale','session_id':'stale','role':'assistant','text':'world','created_at':'2025-01-01T00:01:00Z'},
+    ],source='synthetic')
+    day='2025-01-02'
+    with Store(settings.database) as store:store.conn.execute('INSERT INTO pipeline_schedule VALUES (?,1)',(day,))
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return datetime(2025,1,2,4,tzinfo=p.TZ)
+    async def quiet_routes(*args,**kwargs):return None
+    seen={}
+    async def consume(*args,**kwargs):
+        with Store(settings.database,read_only=True) as store:
+            seen['pending']=store.conn.execute("SELECT count(*) FROM pipeline_batches WHERE status='pending'").fetchone()[0]
+            seen['marker']=store.conn.execute('SELECT completed FROM pipeline_schedule WHERE day=?',(day,)).fetchone()
+        return {'status':'processed','processed_originals':2,'events':1}
+    monkeypatch.setattr(p,'datetime',FixedDateTime)
+    monkeypatch.setattr(p,'flush_routes',quiet_routes)
+    monkeypatch.setattr(p,'_advance',consume)
+    assert asyncio.run(p._scheduled_advance(settings.database))['status']=='processed'
+    assert seen=={'pending':1,'marker':None}
+
+
 def test_auto_pause_does_not_route_originals_or_replace_progress(settings,monkeypatch):
     save_settings(settings.database,{'pipeline':{'auto_enabled':False}})
     def unexpected(*args,**kwargs):raise AssertionError('Paused scheduler must not route or call models')

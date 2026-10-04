@@ -496,8 +496,15 @@ def test_explicit_window_length_is_still_validated(deployment):
 
 def test_selected_embedding_prepares_separate_index(deployment,monkeypatch):
     settings,client=deployment
-    configure(client)
-    assert client.patch('/v1/settings',json={'assignments':{'embedding':'model-a','reranker':'model-a'}}).is_success
+    # Seed the legacy shape directly: old model rows could omit instruction
+    # fields and retain a trailing slash before the grouped Settings editor.
+    from serein.deployment import save_settings
+    save_settings(settings.database,{
+        'models':[{'id':'model-a','label':'Local Model','model':'synthetic-model',
+                   'base_url':'http://127.0.0.1:9999/v1/','api_key':'synthetic-provider-secret',
+                   'protocol':'openai','prompt_cache':'openai'}],
+        'assignments':{'chat':'model-a','writer':'model-a','embedding':'model-a','reranker':'model-a'},
+        'upstream':{'writer_enabled':True}})
     original=httpx.Client
     def handle(request):
         body=json.loads(request.content);inputs=body['input']

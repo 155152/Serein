@@ -17,10 +17,43 @@ def recall_resource_version():
         ('route-examples.json','recall-policy.json'))).hexdigest()
 
 
-def model_index(settings, model):
-    profile = {key:model.get(key) for key in ('id','model','base_url','dimension','query_instruction','document_instruction')}
+def _model_index_path(settings, profile):
     key = hashlib.sha256(json.dumps(profile,sort_keys=True).encode()).hexdigest()[:24]
     return settings.database.parent / 'model-indexes' / key
+
+
+def _model_index_profiles(model):
+    profile = {key:model.get(key) for key in ('id','model','base_url','dimension','query_instruction','document_instruction')}
+    # Settings validation canonicalizes missing instructions to empty strings and
+    # strips a trailing slash from API base URLs. Those are representation-only
+    # changes and must not orphan an already-prepared recall index.
+    canonical = dict(profile)
+    for key in ('query_instruction','document_instruction'):
+        canonical[key] = canonical.get(key) or ''
+    base_url = canonical.get('base_url')
+    if isinstance(base_url,str) and base_url:
+        canonical['base_url'] = base_url.rstrip('/')
+    yield canonical
+    instruction_variants = [canonical]
+    for key in ('query_instruction','document_instruction'):
+        instruction_variants += [{**item,key:None} for item in list(instruction_variants) if item.get(key)=='' and item.get(key) is not None]
+    seen = {json.dumps(canonical,sort_keys=True)}
+    for item in instruction_variants:
+        for candidate in (item, {**item,'base_url':item['base_url']+'/'}) if item.get('base_url') else (item,):
+            marker = json.dumps(candidate,sort_keys=True)
+            if marker not in seen:
+                seen.add(marker)
+                yield candidate
+
+
+def model_index(settings, model):
+    profiles = list(_model_index_profiles(model))
+    primary = _model_index_path(settings, profiles[0])
+    for profile in profiles:
+        candidate = _model_index_path(settings, profile)
+        if (candidate/'ready.json').is_file():
+            return candidate
+    return primary
 
 
 def recall_settings(settings):

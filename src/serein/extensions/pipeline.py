@@ -1539,17 +1539,47 @@ async def scheduled_advance(database):
     return await execute(database,'pipeline',lambda:_scheduled_advance(database))
 
 
+def paused_pipeline_result(database, schedule_day=''):
+    """A paused frozen batch means settlement is blocked, never current/settled."""
+    with Store(database) as store,store.transaction(immediate=True):
+        row=store.conn.execute("SELECT id,result_json FROM pipeline_batches WHERE status='paused_failure' ORDER BY rowid LIMIT 1").fetchone()
+        if row is None:return None
+        if schedule_day:
+            # Self-heal a stale daily completion marker written while this scope
+            # was held. Once retry_batch resumes it, the next tick must settle
+            # the backlog instead of returning settled_today forever.
+            store.conn.execute('DELETE FROM pipeline_schedule WHERE day=?',(schedule_day,))
+        result=json.loads(row['result_json']) if row['result_json'] else {}
+    if not isinstance(result,dict):result={}
+    return {'status':'paused','batch_id':row['id'],**result}
+
+
 async def _scheduled_advance(database):
     if not read_settings(database)['pipeline']['auto_enabled']:
         return {'status':'auto_paused'}
     initialize(database)
     await flush_routes(database)
     current=datetime.now(TZ);day=current.date().isoformat()
+    paused=paused_pipeline_result(database,day)
+    if paused:return paused
     if current.hour<3:return {'status':'waiting_settlement_window'}
     with Store(database,read_only=True) as store:
         row=store.conn.execute('SELECT completed FROM pipeline_schedule WHERE day=?',(day,)).fetchone()
-    if row and row[0]:return {'status':'settled_today'}
+    if row and row[0]:
+        # A completion marker is only a cache of the planner's current state.
+        # Recovery, protocol upgrades, or an earlier scheduler bug may leave it
+        # stale while eligible originals still exist. Let new_batch() be the
+        # authority: if it can form/recover work, reopen the day and process it.
+        if new_batch(database,False,clock=current) is None:
+            return {'status':'settled_today'}
+        with Store(database) as store:
+            store.conn.execute('DELETE FROM pipeline_schedule WHERE day=?',(day,))
     result=await _advance(database)
     if result['status']=='current':
+        # new_batch() deliberately skips scopes held by paused_failure. Recheck
+        # before declaring the day complete so a concurrent pause cannot be
+        # collapsed into a false settled_today marker.
+        paused=paused_pipeline_result(database,day)
+        if paused:return paused
         with Store(database) as store:store.conn.execute('INSERT OR REPLACE INTO pipeline_schedule VALUES (?,1)',(day,))
     return result
