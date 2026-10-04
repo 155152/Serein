@@ -143,6 +143,30 @@ def test_generic_query_is_blocked_before_reranking(legacy):
     assert result['reason']=='global_query_lacks_specific_terms'
 
 
+@pytest.mark.parametrize('query',['你觉得呢？','哥哥——！','是这个吗哥哥！','好喜欢 好喜欢'])
+def test_low_information_chat_does_not_open_global_recall(legacy,query):
+    _,build=legacy
+    engine,calls=build([('s','scene',.99,'2026-09-01')])
+    result=engine.run(query,method='semantic',min_cosine=.5)
+    assert result['status']=='skipped' and not calls
+    assert result['reason']=='global_query_lacks_specific_terms'
+
+
+@pytest.mark.parametrize('query',['奶油泡芙','今天的有氧拳击','番茄鸡蛋面呢','我喜欢红色'])
+def test_concrete_short_topics_still_reach_reranker(legacy,query):
+    _,build=legacy
+    engine,calls=build([('s','scene',.99,'2026-09-01')])
+    result=engine.run(query,method='semantic',min_cosine=.5)
+    assert calls and result['status']=='matched'
+
+
+def test_configured_relationship_name_alone_is_not_a_global_recall_anchor():
+    from serein.recall.germany.recall_policy import RecallPolicy
+    policy=RecallPolicy(relationship_names=['夏以昼'])
+    assert policy.specific_query_terms('夏以昼——！')==[]
+    assert any('生日' in term for term in policy.specific_query_terms('夏以昼生日'))
+
+
 @pytest.mark.parametrize('query',['影分身','误召回'])
 def test_weak_automation_topic_alone_does_not_retrieve(legacy,query):
     _,build=legacy
