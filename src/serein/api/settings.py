@@ -1,6 +1,6 @@
 from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer, ValidationError
 from ..deployment import read_settings, save_settings, TASKS, DEFAULT_FEATURES, DEFAULT_RESUME
 from typing import Literal
 from datetime import date
@@ -69,13 +69,27 @@ class ModelConnection(BaseModel):
         return self
 
 
+class TokenizerWindow(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    path: str = Field(min_length=1, max_length=2000)
+    max_tokens: int = Field(ge=8, le=1000000)
+
+
 class ModelEntry(ModelConnection):
     id: str = Field(min_length=1, max_length=100)
     label: str = Field(min_length=1, max_length=100)
     model: str = Field(min_length=1, max_length=200)
     dimension: int | None = Field(default=None, ge=1, le=65536)
+    tokenizer: TokenizerWindow | None = None
     query_instruction: str = Field(default='', max_length=1000)
     document_instruction: str = Field(default='', max_length=1000)
+
+    @model_serializer(mode='wrap')
+    def preserve_explicit_tokenizer_clear(self, handler):
+        value = handler(self)
+        if 'tokenizer' in self.model_fields_set and self.tokenizer is None:
+            value['tokenizer'] = None
+        return value
 
 
 class ModelRoute(BaseModel):
@@ -84,6 +98,7 @@ class ModelRoute(BaseModel):
     upstream_model: str = Field(min_length=1, max_length=200)
     label: str = Field(default='', max_length=100)
     dimension: int | None = Field(default=None, ge=1, le=65536)
+    tokenizer: TokenizerWindow | None = None
     query_instruction: str = Field(default='', max_length=1000)
     document_instruction: str = Field(default='', max_length=1000)
 
@@ -131,18 +146,20 @@ class DomainEntry(BaseModel):
 
 class TaggingPatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    domains: list[DomainEntry] = Field(max_length=50)
+    domains: list[DomainEntry] | None = Field(default=None, max_length=50)
+    policies: dict[Literal['event', 'scene'], dict[str, Literal['normal', 'explicit_only', 'excluded']]] | None = None
 
     @field_validator('domains')
     @classmethod
     def unique_domains(cls, value):
-        if len({item.key for item in value}) != len(value):
+        if value is not None and len({item.key for item in value}) != len(value):
             raise ValueError('Domain keys must be unique')
         return value
 
 
 class ResumePatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    mode: Literal['command','mcp'] | None = None
     latest_shadow: bool | None = None
     recent_events: bool | None = None
     favorite_scenes: bool | None = None
@@ -213,6 +230,7 @@ class RecallPatch(BaseModel):
 class SettingsPatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
     expected_version: int | None = Field(default=None,ge=0)
+    expected_tagging_version: int | None = Field(default=None,ge=1,strict=True)
     identity: IdentityPatch | None = None
     upstream: UpstreamPatch | None = None
     models: list[ModelEntry] | None = Field(default=None, max_length=50)
@@ -429,7 +447,7 @@ def routes(settings, auth):
             state=read_settings(settings.database)
             domains=state['tagging']['domains']
             return {'ok':True,'active':True,'dataset_version':state['tagging_version'],
-                    'policies':domains,'deployment_state':'instance'}
+                    'policies':domains,'rules':state['tagging'].get('policies',{}),'deployment_state':'instance'}
 
         @router.post('/api/semantic-recall/domain-policies/publish')
         def save_domains(body:dict):
@@ -450,7 +468,12 @@ def routes(settings, auth):
                     patch=TaggingPatch(domains=[{**item,'policy':by_key[item['key']]} for item in current['policies']])
             except (ValidationError, KeyError, TypeError):
                 raise HTTPException(400,'Invalid domain catalog')
-            save_settings(settings.database,{'tagging':patch.model_dump()})
+            from ..core.store import Conflict
+            try:
+                save_settings(settings.database,{'tagging':patch.model_dump(exclude_none=True),
+                    'expected_tagging_version':body['expected_dataset_version']})
+            except Conflict:
+                raise HTTPException(409,'domain_policy_publish_version_conflict') from None
             return read_domains()
 
     class TemplateInput(BaseModel):

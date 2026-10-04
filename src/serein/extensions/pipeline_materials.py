@@ -3,6 +3,32 @@
 USES = {'main', 'background', 'omit', 'mixed'}
 
 
+def retains_boundary_quote(material, content, quote):
+    """An original quote must survive without joining text across omissions."""
+    if not isinstance(material, dict) or material.get('use') not in {'main', 'mixed'}:
+        return False
+    omissions = material.get('omit_quotes')
+    if (not isinstance(omissions, list)
+            or any(not isinstance(item, str) or not item.strip() or item not in content for item in omissions)
+            or (material['use'] == 'main' and omissions)
+            or (material['use'] == 'mixed' and not omissions)):
+        return False
+    # Compare intervals in the original. Repeated omission text is ambiguous,
+    # so none of its occurrences may serve as this side's boundary evidence.
+    omitted = []
+    for text in omissions:
+        start = content.find(text)
+        while start >= 0:
+            omitted.append((start, start + len(text)))
+            start = content.find(text, start + 1)
+    start = content.find(quote)
+    while start >= 0:
+        if not any(start < end and start + len(quote) > left for left, end in omitted):
+            return True
+        start = content.find(quote, start + 1)
+    return False
+
+
 def attach(review, output, plan, component):
     """Validate Curator annotations, then pass them to the matching Writer job."""
     if not component.get('writer_material_review'):

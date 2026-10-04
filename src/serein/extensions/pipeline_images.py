@@ -221,7 +221,7 @@ def decision(output):
 
 def verify_transcriptions(transcriptions, images):
     """Require exact coverage, unchanged bytes and unchanged evidence roles."""
-    if any(item.get('url') for item in images):verify_images(images)
+    verify_images([item for item in images if item.get('url')])
     actual = {(item['source_message_id'], item['position']): item for item in images}
     seen = set()
     for row in transcriptions:

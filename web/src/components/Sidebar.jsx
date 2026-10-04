@@ -8,6 +8,7 @@ import {
   SlidersHorizontal,
   Sparkle,
   NotePencil,
+  Browsers,
 } from "@phosphor-icons/react";
 
 function ThoughtCloud({ size = 20, weight, ...props }) {
@@ -31,6 +32,7 @@ const navItems = [
   { label: "日记", icon: BookOpenText },
   { label: "心绪", icon: ThoughtCloud },
   { label: "备忘", icon: NotePencil },
+  { label: "换窗", icon: Browsers },
   { label: "地下室", icon: SlidersHorizontal },
 ];
 

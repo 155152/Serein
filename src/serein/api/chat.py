@@ -195,8 +195,11 @@ def routes(settings, services, auth):
                         'clock':state['clock']}
         cache_window = window_id + ':' + digest(encode(cache_contract)) if window_id else uuid4().hex
         resume_query = chat_resume.continuation(query)
+        command_resume = state['features']['resume'] and state['resume']['mode']=='command'
         if resume_query is not None and not state['features']['resume']:
             raise HTTPException(409, 'Enable resume in Settings before using /resume')
+        if resume_query is not None and not command_resume:
+            raise HTTPException(409, 'MCP resume is active; use the resume tool or select command mode in Settings')
         snapshot_key, snapshot = context._find_turn_injection_snapshot(cache_window, incoming, body)
         replay = snapshot is not None and (not query or len(incoming)==snapshot['source_message_count'])
         selected = []
@@ -217,7 +220,7 @@ def routes(settings, services, auth):
             stable = activity = recalled = ''
             messages = remove_images_for_eyes(incoming) if state['features'].get('image_eyes') else incoming
             retained_anchor = ''
-            if resume_query is None and state['features']['resume']:
+            if resume_query is None and command_resume:
                 resume_snapshot = await asyncio.to_thread(chat_resume.retained, services, window_id, incoming, context)
                 if resume_snapshot:
                     messages, retained_anchor = chat_resume.mark_retained_anchor(messages, resume_snapshot, context)
@@ -249,7 +252,8 @@ def routes(settings, services, auth):
                 from ..chat_state import recent_deliveries
                 cooldown = list(dict.fromkeys([*recent_deliveries(settings.database,window_id), *delivered_ids]))
                 result = await asyncio.to_thread(services.recall, query, method='semantic', mode='surface',
-                    min_cosine=-1, limit=2, delivered_ids=cooldown, deadline_at=time.monotonic()+30)
+                    min_cosine=-1, limit=2, user_utterance=True,
+                    delivered_ids=cooldown, deadline_at=time.monotonic()+30)
                 recalled = result.get('context','')
                 selected = result.get('selected_refs',[]) if recalled else []
                 summary = recall_summary(result)
@@ -382,14 +386,14 @@ def routes(settings, services, auth):
         if not model:raise HTTPException(503,'Select a Writer model in Settings')
         if not isinstance(body.get('prompt'),str) or not isinstance(body.get('output_schema'),dict):
             raise HTTPException(400,'Writer requires prompt and output_schema')
-        images=body.get('image_inputs',[])
-        if not isinstance(images,list) or any(not isinstance(url,str) or not url.startswith(('https://','http://','data:image/')) for url in images):
-            raise HTTPException(400,'Writer requires complete accessible images')
-        content=[{'type':'text','text':body['prompt']}, *[{'type':'image_url','image_url':{'url':url}} for url in images]] if images else body['prompt']
+        if body.get('image_inputs'):
+            raise HTTPException(400,'Narrative Writer accepts text materials only')
         try:
-            result=await complete(model,{'messages':[{'role':'user','content':content}],
-                'response_format':{'type':'json_schema','json_schema':{'name':'narrative_preview','strict':True,'schema':body['output_schema']}}})
+            result=await asyncio.wait_for(complete({**model,'request_timeout_seconds':300},{'messages':[{'role':'user','content':body['prompt']}],
+                'response_format':{'type':'json_schema','json_schema':{'name':'narrative_preview','strict':True,'schema':body['output_schema']}}}),timeout=300)
             return {'result':json.loads(result['choices'][0]['message']['content'])}
+        except (httpx.TimeoutException,TimeoutError):
+            raise HTTPException(504,'Narrative Writer exceeded 5 minutes') from None
         except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError):
             raise HTTPException(502,'Writer returned an invalid result') from None
     return router

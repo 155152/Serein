@@ -9,11 +9,13 @@ import { BasementPage } from "./pages/BasementPage.jsx";
 import { GardenPage } from "./pages/GardenPage.jsx";
 import "./garden-page.css";
 import { PersonaPage, MemosPage } from "./pages/CompanionPages.jsx";
+import { ResumePage } from "./pages/ResumePage.jsx";
 
-const availableAreas = new Set(["醒来", "记忆", "叙事卷", "日记", "地下室", "花园", "设置", "心绪", "备忘", "使用说明"]);
+const availableAreas = new Set(["醒来", "记忆", "叙事卷", "日记", "地下室", "花园", "设置", "心绪", "备忘", "使用说明", "换窗"]);
 const areaHashes = {
   心绪: "#persona",
   备忘: "#memos",
+  换窗: "#resume",
   醒来: "#awake",
   设置: "#settings",
   使用说明: "#help",
@@ -25,6 +27,7 @@ const areaHashes = {
 };
 
 const readAreaFromHash = () => {
+  if (window.location.hash === "#resume") return "换窗";
   if (window.location.hash === "#persona") return "心绪";
   if (window.location.hash === "#memos") return "备忘";
   if (window.location.hash === "#help") return "使用说明";
@@ -127,7 +130,7 @@ export function App() {
                 ? "diary"
                 : activeArea === "地下室"
                   ? "basement"
-                  : ["设置", "使用说明"].includes(activeArea) ? "settings" : ["心绪", "备忘"].includes(activeArea) ? "companion" : "garden"
+                  : activeArea === "换窗" ? "resume" : ["设置", "使用说明"].includes(activeArea) ? "settings" : ["心绪", "备忘"].includes(activeArea) ? "companion" : "garden"
       }`}
     >
       <AwakePage
@@ -141,6 +144,11 @@ export function App() {
         onSettingsOpenChange={setSettingsOpen}
         onOpenEventGuide={() => { navigateTo("使用说明"); setHelpPage("events"); }}
       />
+
+      {activeArea === "换窗" && <section className="resume-page" aria-label="换窗">
+        <ResumePage onOpenSettings={() => { window.dispatchEvent(new CustomEvent("serein:open-settings-tab", {detail:"features"})); navigateTo("设置"); }}/>
+        <Sidebar activeArea={activeArea} onNavigate={navigateTo} onOpenSettings={() => setSettingsOpen(true)}/>
+      </section>}
 
       {activeArea === "使用说明" && <section className="help-page" aria-label="使用说明">
         <div className="settings-panel settings-page">

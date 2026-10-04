@@ -97,6 +97,21 @@ def parse_file(content,filename,names,mode='auto',stamp=None):
         links=data.get('links',[])
         if links:warnings.append(f'保留备份中的 {len(links)} 条旧关联信息；它们不会直接变成已审核的 Scene 关系。')
         return {'format':'operit','entries':entries,'warnings':warnings,'links':links,'export_date':data.get('exportDate'),'source_hash':source_hash}
+    sillytavern_header=None
+    if isinstance(data,list) and data and isinstance(data[0],dict) and 'mes' not in data[0] and (
+            'chat_metadata' in data[0] or {'user_name','character_name'}<=data[0].keys()):
+        sillytavern_header=data[0]
+        metadata=sillytavern_header.get('chat_metadata',{})
+        if not isinstance(metadata,dict):raise ValueError('SillyTavern chat_metadata 必须是对象')
+        integrity=metadata.get('integrity');created=sillytavern_header.get('create_date')
+        session_key=['integrity',integrity] if integrity else ['create_date',created,
+            sillytavern_header.get('user_name'),sillytavern_header.get('character_name')] if created else None
+        if session_key:
+            session='sillytavern-'+digest(encode(session_key))[:32]
+        else:
+            session='sillytavern-file-'+digest(encode(data))[:32]
+            warnings.append('SillyTavern 缺少 integrity / create_date，会话标识由完整导出生成；裁剪或追加后无法跨文件自动去重。')
+        data=[{'id':session,'messages':data[1:],'sillytavern':True}]
     if isinstance(data,dict) and 'conversations' in data:data=data['conversations']
     if isinstance(data,dict) and ('role' in data or 'sender' in data):data=[data]
     if isinstance(data,list) and data and all(isinstance(row,dict) and ('role' in row or 'sender' in row) for row in data):
@@ -110,33 +125,52 @@ def parse_file(content,filename,names,mode='auto',stamp=None):
         if not isinstance(conversation,dict):raise ValueError('对话条目必须是对象')
         if 'mapping' in conversation:messages=chatgpt_messages(conversation);fmt='chatgpt'
         elif 'chat_messages' in conversation:messages=conversation['chat_messages'];fmt='claude'
-        elif 'messages' in conversation:messages=conversation['messages'];fmt='text' if extension in ('.txt','.md') else 'messages'
+        elif 'messages' in conversation:messages=conversation['messages'];fmt='sillytavern' if conversation.get('sillytavern') else 'text' if extension in ('.txt','.md') else 'messages'
         elif 'events' in conversation:messages=conversation['events'];fmt='raw'
-        else:raise ValueError('无法识别聊天记录，请提供 Claude、ChatGPT、messages/events 或带角色的文本导出')
+        else:raise ValueError('无法识别聊天记录，请提供 Claude、ChatGPT、SillyTavern、messages/events 或带角色的文本导出')
         if not isinstance(messages,list):raise ValueError('messages 必须是列表')
         formats.add(fmt)
         session=str(conversation.get('uuid') or conversation.get('id') or conversation.get('conversation_id') or
                     conversation.get('session_id') or 'file-'+digest(encode(messages))[:24])
+        native_ids={};hidden=0;position_ids=0;colliding_times=0
         for index,message in enumerate(messages):
             if not isinstance(message,dict):raise ValueError('消息必须是对象')
             author=message.get('author',{});author=author if isinstance(author,dict) else {}
-            role=str(message.get('sender') or message.get('role') or author.get('role') or '').lower()
+            if fmt=='sillytavern':
+                if not isinstance(message.get('is_user'),bool) or not isinstance(message.get('mes'),str):
+                    raise ValueError(f'SillyTavern 第 {index+1} 条消息需要布尔 is_user 和字符串 mes，未开始导入')
+                # is_system also marks hidden dialogue; it is not a role.
+                role='user' if message['is_user'] else 'assistant'
+            else:role=str(message.get('sender') or message.get('role') or author.get('role') or '').lower()
             role={'human':'user','ai':'assistant','bot':'assistant'}.get(role,role)
             if role not in ('user','assistant'):skipped+=1;continue
-            value=message.get('text',message.get('content',''));text=text_content(value)
+            value=message['mes'] if fmt=='sillytavern' else message.get('text',message.get('content',''));text=text_content(value)
             if not text.strip():skipped+=1;continue
-            original_time=message.get('created_at',message.get('create_time',message.get('timestamp',message.get('time'))))
+            original_time=message.get('send_date') if fmt=='sillytavern' else message.get('created_at',message.get('create_time',message.get('timestamp',message.get('time'))))
             if original_time in (None,''):missing_times+=1
-            message_id=str(message.get('uuid') or message.get('id') or message.get('source_event_id') or message.get('message_id') or f'position-{index}')
+            created=timestamp(original_time,stamp)
+            message_id=message.get('uuid') or message.get('id') or message.get('source_event_id') or message.get('message_id')
+            if fmt=='sillytavern':
+                hidden+=message.get('is_system') is True
+                if not message_id and original_time not in (None,''):
+                    key=encode([created,role]);ordinal=native_ids.get(key,0);native_ids[key]=ordinal+1
+                    message_id='send-date:'+key+':'+str(ordinal)
+                    colliding_times+=ordinal>0
+                elif not message_id:position_ids+=1
+            message_id=str(message_id or f'position-{index}')
             entries.append({'source':'import-'+fmt,'source_event_id':digest(encode([session,message_id])),
                 'session_id':session,'conversation_id':session,'role':role,'text':text,
-                'created_at':timestamp(original_time,stamp),'metadata':{'original_message_id':message_id,
+                'created_at':created,'metadata':{'original_message_id':message_id,
                     'original_timestamp':original_time,'timestamp_source':'export' if original_time not in (None,'') else 'import_time',
                     'original_message':message,'conversation_title':conversation.get('name',conversation.get('title','')),
                     'source_file':Path(filename).name}})
+        if hidden:warnings.append(f'{hidden} 条 SillyTavern 隐藏消息按 is_user 保留为原话；is_system 不作为系统角色过滤。')
+        if position_ids:warnings.append(f'{position_ids} 条 SillyTavern 消息缺少消息 ID 和 send_date，按会话内位置识别；不要裁剪或重排这些消息后期待跨文件去重。')
+        if colliding_times:warnings.append('SillyTavern 同一角色有多条消息的 send_date 相同，按出现顺序区分；分段时请将这些同时间消息留在同一段，保留完整顺序。')
     if skipped:warnings.append(f'{skipped} 条系统、工具或无文字消息未作为对话导入；文字消息中的原始结构保留在元数据里。')
     if missing_times:warnings.append(f'{missing_times} 条消息没有时间，使用首次导入时间归档，并标注“原始时间未知”。')
-    return {'format':'+'.join(sorted(formats)),'entries':entries,'warnings':warnings,'source_hash':source_hash}
+    return {'format':'+'.join(sorted(formats)),'entries':entries,'warnings':warnings,'source_hash':source_hash,
+            **({'sillytavern_header':sillytavern_header} if sillytavern_header is not None else {})}
 
 
 class ImportArchive(RawEventStore):

@@ -39,6 +39,21 @@ def post(client, messages, **values):
     return client.post('/v1/chat/completions', json={'messages':messages, **values})
 
 
+def test_mcp_mode_blocks_command_and_does_not_reinject_retained_command_context(chat):
+    settings,client,payloads=chat
+    history=[{'role':'user','content':'/resume Continue here'}]
+    assert post(client,history,window_id='exclusive',memory=False).status_code==200
+    assert 'Full shadow marker' in json.dumps(payloads[-1])
+    save_settings(settings.database,{'resume':{'mode':'mcp'}})
+    before=len(payloads)
+    response=post(client,[{'role':'user','content':'/resume'}],window_id='exclusive',memory=False)
+    assert response.status_code==409 and len(payloads)==before
+    history.extend([{'role':'assistant','content':'Synthetic reply'},{'role':'user','content':'A normal followup'}])
+    response=post(client,history,window_id='exclusive',memory=False)
+    assert response.status_code==200 and response.headers['X-Serein-Resume']=='none'
+    assert 'Full shadow marker' not in json.dumps(payloads[-1])
+
+
 def test_resume_and_followup_full_pages_persist_and_match_history(chat):
     settings, client, payloads = chat
     messages = [{'role':'user','content':'/resume 接着聊昨天的书吧'}]

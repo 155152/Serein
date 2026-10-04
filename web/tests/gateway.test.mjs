@@ -28,6 +28,12 @@ test('gateway separates web auth from API auth, saves settings and streams respo
       res.writeHead(req.url==='/register'?201:200,{'Content-Type':'application/json'});res.end('{"oauth":true}');return;
     }
     if(req.headers.authorization!=='Bearer synthetic-api-key'){res.writeHead(401);res.end('{}');return;}
+    if(req.url==='/v1/extensions/resume'){
+      let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
+        requests.push({path:req.url,body:JSON.parse(raw)});
+        res.writeHead(200,{'Content-Type':'application/json'});res.end('{"status":"ok"}');
+      });return;
+    }
     if(req.url==='/api/hook/recall'){
       let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
         const body=JSON.parse(raw||'{}');requests.push({path:req.url,body});
@@ -105,6 +111,19 @@ test('gateway separates web auth from API auth, saves settings and streams respo
     const saved=await fetch(base+'/__serein/settings',{method:'PATCH',headers:{...auth,'Content-Type':'application/json',Origin:base},body:'{"identity":{"user_name":"Example"}}'});
     assert.equal(saved.status,200);
     assert.ok(requests.some(r=>r.path==='/v1/settings'&&r.method==='PATCH'&&r.auth==='Bearer synthetic-api-key'));
+    const resumeHeaders={...auth,'Content-Type':'application/json',Origin:base};
+    const resume=await fetch(base+'/__serein/resume',{method:'POST',headers:resumeHeaders,body:'{"cursor":""}'});
+    assert.equal(resume.status,200);
+    assert.equal(resume.headers.get('cache-control'),'no-store');
+    assert.ok(requests.some(r=>r.path==='/v1/extensions/resume'&&r.method==='POST'&&r.auth==='Bearer synthetic-api-key'));
+    assert.equal((await fetch(base+'/__serein/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
+    const beforeCrossSite=requests.length;
+    assert.equal((await fetch(base+'/__serein/resume',{method:'POST',headers:{...resumeHeaders,Origin:'https://unrelated.example'},body:'{}'})).status,403);
+    assert.equal(requests.length,beforeCrossSite);
+    const draft={recent_events:false,selected_ids:Array.from({length:200},(_,index)=>`synthetic-${index}-`+'x'.repeat(100))};
+    const draftPreview=await fetch(base+'/__serein/resume',{method:'POST',headers:resumeHeaders,body:JSON.stringify({selection:draft})});
+    assert.equal(draftPreview.status,200);
+    assert.deepEqual(requests.findLast(r=>r.path==='/v1/extensions/resume'&&r.body).body.selection,draft);
     const discovery=await fetch(base+'/__serein/settings/models/discover',{method:'POST',headers:{...auth,'Content-Type':'application/json',Origin:base},body:'{"upstream_id":"test","base_url":"https://provider.example/v1"}'});
     assert.equal(discovery.status,200);
     assert.ok(requests.some(r=>r.path==='/v1/settings/models/discover'&&r.method==='POST'&&r.auth==='Bearer synthetic-api-key'));

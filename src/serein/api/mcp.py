@@ -271,13 +271,22 @@ def create_server(app: Application, *, private=False, http=False):
             server.remove_tool(name)
         app.refresh_optional()
         optional_names = set() if private else app._optional_names - internal_tools
+        if not private and 'resume' in app._optional_names:
+            from ..deployment import read_settings
+            if read_settings(app.settings.database)['resume']['mode']=='mcp':
+                optional_names.add('resume')
         if app.settings.mcp_tools is not None:
             optional_names.intersection_update(app.settings.mcp_tools)
         for name in optional_names:
             function = app.contributions.tools[name]
-            exposed = favorite_text_tool(function) if name == 'read_favorites' else function
-            server.add_tool(exposed, name=name, annotations=read_only if name in {'source_message_search','source_message_read','read_favorites'} else None,
-                            structured_output=False if name == 'read_favorites' else None)
+            if name=='resume':
+                from ..extensions.handoff import resume_text_tool
+                exposed=resume_text_tool(function)
+            else:exposed = favorite_text_tool(function) if name == 'read_favorites' else function
+            annotation=ToolAnnotations(readOnlyHint=True,destructiveHint=False,idempotentHint=True,openWorldHint=False) if name=='resume' else read_only if name in {'source_message_search','source_message_read','read_favorites'} else None
+            server.add_tool(exposed, name=name, annotations=annotation,
+                            structured_output=False if name in {'read_favorites','resume'} else None)
+            if name=='resume':server._tool_manager.get_tool(name).parameters['additionalProperties']=False
 
     async def list_tools():
         refresh_optional()
@@ -285,6 +294,10 @@ def create_server(app: Application, *, private=False, http=False):
 
     async def call_tool(name, arguments):
         refresh_optional()
+        if name=='resume':
+            tool=server._tool_manager.get_tool(name)
+            if tool and set(arguments or {})-tool.parameters['properties'].keys():
+                raise ValueError('Unexpected resume arguments; refresh the tool schema')
         if not private and name in authored_names:
             tool = server._tool_manager.get_tool(name)
             legacy = legacy_server._tool_manager.get_tool(name)

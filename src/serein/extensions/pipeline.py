@@ -8,7 +8,7 @@ from ..core.store import Store, Conflict, encode, digest, now
 from ..deployment import identity, task_model, read_settings
 from .pipeline_limits import blocks, allowed_ids
 from ..compat.events import Events, reference_blockers
-from ..compat.germany.fact_events import FactEventStore
+from ..compat.germany.fact_events import FactEventStore, FactEventSettlementBlockedError
 from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
 from . import pipeline_latest as latest
 from .pipeline_config import snapshot, execution
@@ -353,6 +353,16 @@ def new_batch(database,include_recent,clock=None):
                     database,eligible,stable,eligible_rows,ready_ids)
                 if not stable:continue
                 scope=digest(encode([source,session]))[:20]
+                omitted_today=set()
+                for previous in store.conn.execute(
+                    "SELECT result_json FROM pipeline_batches WHERE scope=? AND status='done' "
+                    "AND json_extract(input_json,'$.day')=? "
+                    "AND json_array_length(result_json,'$.curator_omission_deferrals')>0",
+                    (scope,watermark.date().isoformat())):
+                    for entry in json.loads(previous['result_json']).get('curator_omission_deferrals') or []:
+                        omitted_today.update(entry.get('deferred_source_message_ids') or [])
+                if {item['id'] for item in stable}.intersection(omitted_today):
+                    continue
                 with latest.identity_scope(identity(database)):
                     tracks,ordinal=track_state.load_tracks(store,source,session,eligible[0]['id'],task_message,
                                                            lookback_days=policy.get('track_lookback_days',3))
@@ -515,9 +525,12 @@ def save_routing_snapshot(database,batch,data,routed):
     return data
 
 
-def mark_needs_repair(database,batch,error):
+def mark_needs_repair(database,batch,error,*,settlement=False):
     detail={'status':'needs_repair','batch_id':batch['id'],'reason':str(error),
-            'note':'归线材料需要修复；原话和已完成步骤保留。修复后点击“重新校验并继续”。'}
+            'note':('旧 Event 的替换状态或绑定原话已变化，保存被阻止；原话和模型结果保留。请先核对旧 Event；'
+                    '无法恢复原计划时，明确作废本批计划并重新归线。' if settlement else
+                    '归线材料需要修复；原话和已完成步骤保留。修复后点击“重新校验并继续”。')}
+    if settlement:detail['repair_kind']='event_settlement'
     with Store(database) as store,store.transaction(immediate=True):
         store.conn.execute("UPDATE pipeline_batches SET status='needs_repair',result_json=? WHERE id=?",(encode(detail),batch['id']))
     return detail
@@ -709,6 +722,67 @@ def overflow_plan(component):
             'hard_skips':[],'host_deferrals':list(component.get('base_event_candidate_overflow') or [])}
 
 
+def curator_omission_plan(component,output):
+    stable_ids=sorted({int(item['id']) for item in component.get('messages') or []})
+    missing=output['_host_curator_omission']['missing_source_message_ids']
+    if not missing or not set(missing).issubset(stable_ids):
+        raise ValueError('Host Curator omission record is outside its frozen stable sources')
+    return {'events':[],'skip_source_message_ids':[],'defer_source_message_ids':stable_ids,
+            'hard_skips':[], 'curator_omission_deferrals':[
+                {'reason':'curator_omitted','missing_source_message_ids':missing,
+                 'deferred_source_message_ids':stable_ids}]}
+
+
+def propagate_curator_omission(plans):
+    deferred={source_id for _,plan,_ in plans for entry in plan.get('curator_omission_deferrals',[])
+              for source_id in entry['deferred_source_message_ids']}
+    if not deferred:return plans
+    plans=list(plans)
+    changed=True
+    while changed:
+        changed=False
+        for index,(component,plan,_) in enumerate(plans):
+            if plan.get('curator_omission_deferrals'):
+                continue
+            stable_ids={int(item['id']) for item in component.get('messages') or []}
+            shared=stable_ids.intersection(deferred)
+            if not shared:
+                continue
+            replacement=curator_omission_plan(component,{'_host_curator_omission':{
+                'missing_source_message_ids':sorted(shared)}})
+            replacement['curator_omission_deferrals'][0]['reason']='curator_omission_dependency'
+            plans[index]=(component,replacement,[])
+            deferred.update(stable_ids)
+            changed=True
+    return plans
+
+
+def pause_repeated_curator_omission(database,batch,component,output):
+    stable_ids={int(item['id']) for item in component.get('messages') or []}
+    with Store(database,read_only=True) as store:
+        rows=store.conn.execute(
+            "SELECT json_extract(input_json,'$.day') AS day,result_json FROM pipeline_batches "
+            "WHERE scope=? AND status='done' "
+            "AND json_array_length(result_json,'$.curator_omission_deferrals')>0",(batch['scope'],)).fetchall()
+    rounds={source_id:set() for source_id in stable_ids}
+    for row in rows:
+        for entry in json.loads(row['result_json']).get('curator_omission_deferrals') or []:
+            if entry.get('reason')!='curator_omitted':continue
+            for source_id in stable_ids.intersection(entry.get('deferred_source_message_ids') or []):
+                rounds[source_id].add(row['day'])
+    prior=max((len(days) for days in rounds.values()),default=0)
+    if prior<2:return
+    missing=output['_host_curator_omission']['missing_source_message_ids']
+    reason=f'Curator 在同一审阅范围累计三轮漏项，本轮遗漏原话 {missing}；已暂停，请检查模型输出后重试此批次'
+    result={'status':'paused','batch_id':batch['id'],'reason':reason,'failures':prior+1,
+            'job_id':output['_host_curator_omission']['job_id'],
+            'curator_omission_source_message_ids':missing}
+    with Store(database) as store,store.transaction(immediate=True):
+        store.conn.execute("UPDATE pipeline_batches SET status='paused_failure',result_json=? WHERE id=?",
+                           (encode(result),batch['id']))
+    raise PausedBatch(reason)
+
+
 def routing_units(messages,assignments):
     by_id={item['source_message_id']:item for item in assignments};units=[];edges=[]
     for item in messages:
@@ -755,17 +829,26 @@ def request_for(database,batch,role,**fields):
         if role=='track_router':
             request.update(messages=data['routing_messages'],active_tracks=track_state.parked(data['tracks']),
                            next_track_ordinal=data.get('next_track_ordinal',track_state.next_ordinal(data['scope'],data['tracks'])))
-            prompt=latest.build_event_track_message_prompt(data['day'],request['messages'],request['active_tracks'],recent_context_messages=data['recent'])
+            prompt=latest.build_event_track_message_prompt(data['day'],request['messages'],request['active_tracks'],recent_context_messages=data['recent'],include_role_rules=False)
         elif role=='event_curator':
             component=fields['component']
             image_messages=image_source_messages(database,component['context_messages'])
             images,missing=writer_images(image_messages,{m['id'] for m in component['messages']})
+            from ..image_transcription import transcribed_image_receipts
+            cached_images=(transcribed_image_receipts(image_messages,images)
+                           if fields.get('transcription_only') or fields.get('pretranscribed') else [])
+            cached_keys={(image['source_message_id'],image['position']) for image in cached_images}
             skipped=list(component.get('missing_images') or [])
             skipped.extend({'source_message_id':source_id,'reason':'original_missing'} for source_id in missing
                            if not any(row['source_message_id']==source_id for row in skipped))
             gone={(row['source_message_id'],row.get('position')) for row in skipped}
             images=[image for image in images if (image['source_message_id'],image['position']) not in gone]
-            frozen_images=freeze_task_images(database,batch['id'],images,component.get('images',[]),missing=skipped)
+            frozen_images=freeze_task_images(database,batch['id'],
+                [image for image in images if (image['source_message_id'],image['position']) not in cached_keys],
+                component.get('images',[]),missing=skipped)
+            by_key={(image['source_message_id'],image['position']):image for image in [*cached_images,*frozen_images]}
+            frozen_images=[by_key[(image['source_message_id'],image['position'])] for image in images
+                           if (image['source_message_id'],image['position']) in by_key]
             component['missing_images']=skipped
             component['images']=[{key:value for key,value in item.items() if key not in ('url','original_url')}
                                  for item in frozen_images]
@@ -785,20 +868,44 @@ def request_for(database,batch,role,**fields):
             elif request['images']:
                 prompt+='\n必须逐张转录图片里的可见原文，标题、正文、评论按区块保留；在同一 text 中用 [画面] 简述可见人物、物件、布局和关系，用 [文字] 放逐字转录。没有文字也保留画面描述；不猜身份、动机或前后经过，看不清标 unreadable。Writer 只读转录，不接收原图。最终 JSON 额外包含 image_transcriptions 数组，每图恰好一项：'+encode({'input_image':1,'text':'可见原文与画面描述','unreadable':False})
         else:
-            event=fields['event'];component=fields['component']
+            event=dict(fields['event']);component=fields['component']
+            if event['action']=='extend':event['append_only']=True
+            request['event']=event
             selected_bases=[base for base in component['base_event_candidates'] if base['event_id'] in event['base_event_ids']]
             append_only=bool(event.get('append_only'))
-            prompt=latest.build_event_writer_prompt(data['day'],'',fields['messages'],context_messages=component['context_messages'],
+            inherited={key for base in component['base_event_candidates'] for key in base['source_message_ids']}
+            current={m['id'] for m in component['messages']} - inherited
+            related={key for base in selected_bases for key in base['source_message_ids']}
+            full_rewrite=event['action'] in ('rewrite','merge')
+            owned_ids=set(event['source_message_ids']) & (current | (related if full_rewrite else set()))
+            messages=[m for m in component['context_messages'] if m['id'] in owned_ids]
+            context=[];context_chars=0
+            for m in sorted(component['context_messages'],key=lambda m:m['id'],reverse=True):
+                if append_only and (not fields.get('context_read') or
+                        m['id'] not in (component.get('context_receipt') or {}).get('read_source_ids',[])):continue
+                if m['id'] in owned_ids or m['id'] in inherited:continue
+                size=len(m.get('content',''))
+                if len(context)<6 and context_chars+size<=6000:
+                    context.append(m);context_chars+=size
+            reading=messages+context
+            request['messages']=messages
+            request['writer_previous_body_only']=3
+            request['writer_mode']='append' if append_only else 'rewrite' if full_rewrite else 'create'
+            prompt=latest.build_event_writer_prompt(data['day'],'',messages,context_messages=reading,
                 track_cards=component['track_cards'],source_activity_roles={int(b['source_message_id']):b['activity_role'] for b in event['source_bindings']},
                 previous_events=[] if append_only else selected_bases, include_role_rules=False,
                 track_context_events=([*component['base_event_candidates'],*selected_bases]
                                       if append_only else component['base_event_candidates']),
                 source_materials=[row for row in event.get('source_materials',[])
-                                  if row['source_message_id'] in {message['id'] for message in fields['messages']}]
-                    if event.get('source_materials') is not None else None)
+                                  if row['source_message_id'] in {message['id'] for message in messages}]
+                    if event.get('source_materials') is not None else None,append_only=append_only,
+                context_read=bool(fields.get('context_read')))
             if append_only:
-                prompt+='\n旧 Event 受保护：只写新 owned 原文构成的后续段落；旧正文由程序原样保留并追加，不重写旧标题或召回设置。\n'
-            owned={m['id'] for m in fields['messages']};allowed={m['id'] for m in component['context_messages']}
+                remaining=max(0,latest.EVENT_BODY_ACCEPT_MAX_CHARS-len(selected_bases[0]['body'])-2)
+                request['append_remaining_chars']=remaining
+                prompt+='\n只写新 owned 原文构成的后续段落，不复述或重写旧经历；旧正文由程序原样保留并追加，不重写旧标题或召回设置。\n'
+                prompt+=f'整篇 Event 总计不得超过 1500 字符（含拼接的两个换行）；本次新增段落最多 {remaining} 字符。写清就停，不截断旧正文。\n'
+            owned={m['id'] for m in messages};allowed={m['id'] for m in reading}
             bound_images=[{**item,'evidence_role':'owned' if item['source_message_id'] in owned else 'context_only'} for item in component.get('images',[]) if item['source_message_id'] in allowed]
             unavailable={(i['source_message_id'],i['position'],i['sha256']) for i in component.get('unavailable_images',[])}
             bound_images=[i for i in bound_images if (i['source_message_id'],i['position'],i['sha256']) not in unavailable]
@@ -849,6 +956,8 @@ def validate(request,output):
     output=prepare_stage_output(request,output)
     if not isinstance(output,dict):raise ValueError('Stage output must be a JSON object')
     role=request['role']
+    if '_host_curator_omission' in output:
+        raise ValueError('Host Curator omission receipts cannot be submitted by a model')
     if role not in ROLES:raise ValueError('This pipeline stage is retired or unknown; request the next task')
     if request.get('transcription_only'):
         if set(output)!={'image_transcriptions'}:raise ValueError('补读图片只允许返回转录，不改变 Event 归属')
@@ -869,6 +978,9 @@ def validate(request,output):
                 component['curator_image_transcriptions']=bound
             latest.normalize_event_curator_output(decision(output),component)
         else:
+            if (request.get('writer_mode')=='append' and output.get('evidence_sufficient')
+                    and len(str(output.get('event_draft') or '').strip())>request['append_remaining_chars']):
+                raise ValueError(f"新增段落超过剩余 {request['append_remaining_chars']} 字符；旧正文与新增段落总计不得超过 1500 字符，请压缩新增段落，不重写或截断旧正文。")
             transcriptions:dict[int,list[str]]={}
             for item in request.get('curator_image_transcriptions') or []:
                 if item.get('evidence_role')=='owned' and type(item.get('source_message_id')) is int:
@@ -905,18 +1017,22 @@ def curator_repair_prompt(request, output, error):
         'previous_output':output})
 
 
-def pause_curator_repair(database,job_id,error):
-    # Exhausted repair is a failure of the frozen job, never a successful defer.
+def accept_curator_omission(database,job_id,error):
+    # Discard the incomplete decision; only the host may retain its full scope.
     with Store(database) as store,store.transaction(immediate=True):
-        row=store.conn.execute('SELECT j.batch_id,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
+        row=store.conn.execute('SELECT j.request_json,j.output_json,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
         if row is None or row['status'].startswith('superseded_'):
-            raise Conflict('Curator job changed before repair could be paused')
-        reason=f'Curator 漏项修复失败，遗漏原话 {error.missing_source_ids}；完整审阅材料已保留，请重试此批次'
-        result={'status':'paused','batch_id':row['batch_id'],'job_id':job_id,'reason':reason,
-                'curator_omission_source_message_ids':error.missing_source_ids}
-        store.conn.execute("UPDATE pipeline_batches SET status='paused_failure',result_json=? WHERE id=?",
-                           (encode(result),row['batch_id']))
-    raise PausedBatch(reason)
+            raise Conflict('Curator job changed before its omission could be retained')
+        request=json.loads(row['request_json'])
+        stable_ids={int(item['id']) for item in request.get('component',{}).get('messages') or []}
+        missing=sorted(set(error.missing_source_ids))
+        if request['role']!='event_curator' or not missing or not set(missing).issubset(stable_ids):
+            raise ValueError('Host Curator omission record is outside its frozen stable sources')
+        output={'_host_curator_omission':{'job_id':job_id,'missing_source_message_ids':missing}}
+        if row['output_json'] and row['output_json']!=encode(output):
+            raise Conflict('This job already has a different result')
+        store.conn.execute('UPDATE pipeline_jobs SET output_json=? WHERE id=?',(encode(output),job_id))
+    return {'status':'host_deferred','job_id':job_id,'output':output}
 
 
 def submit(database,job_id,output):
@@ -925,7 +1041,7 @@ def submit(database,job_id,output):
         record_attempt(database,job_id,encode(output),str(error))
         if curator_omission_attempts(database,job_id)<2:
             raise
-        pause_curator_repair(database,job_id,error)
+        return accept_curator_omission(database,job_id,error)
     except ValueError as error:
         record_attempt(database,job_id,encode(output),str(error))
         raise
@@ -1000,10 +1116,12 @@ def retry_batch(database,batch_id):
         # The synthetic reset marker belongs only to Curator omission repair.
         # General stage retries already retain their real attempt history.
         for job in store.conn.execute("SELECT id FROM pipeline_jobs WHERE batch_id=? "
-                                      "AND role='event_curator' AND output_json IS NULL",(batch_id,)):
+                                      "AND (role='event_curator' OR role LIKE 'event_curator:%') "
+                                      "AND (output_json IS NULL OR json_extract(output_json,'$._host_curator_omission') IS NOT NULL)",(batch_id,)):
             number=store.conn.execute('SELECT count(*) FROM pipeline_attempts WHERE job_id=?',(job['id'],)).fetchone()[0]+1
             store.conn.execute('INSERT INTO pipeline_attempts(job_id,attempt,created_at,output_text,error) VALUES (?,?,?,?,?)',
                                (job['id'],number,now(),'','curator_omission_retry_reset'))
+            store.conn.execute('UPDATE pipeline_jobs SET output_json=NULL WHERE id=?',(job['id'],))
         store.conn.execute('DELETE FROM pipeline_job_failures WHERE job_id IN (SELECT id FROM pipeline_jobs WHERE batch_id=? AND output_json IS NULL)',(batch_id,))
         store.conn.execute("UPDATE pipeline_batches SET status='pending',result_json=NULL WHERE id=?",(batch_id,))
     return {'status':'resumed','batch_id':batch_id}
@@ -1034,6 +1152,9 @@ async def job(database,batch,request,key,runner):
     incoming=request
     current_execution=request['execution']
     request=hydrate_request_images(database,batch['id'],json.loads(row['request_json']))
+    if request['role']=='event_writer' and not row['output_json'] and request.get('writer_previous_body_only')!=3:
+        request=request_for(database,batch,'event_writer',**{key:request[key] for key in
+            ('messages','event','component','context_read') if key in request})
     request['execution']=current_execution
     incoming.clear();incoming.update(request)
     if not row['output_json']:
@@ -1044,6 +1165,8 @@ async def job(database,batch,request,key,runner):
         total=store.conn.execute("SELECT count(*) FROM pipeline_jobs WHERE batch_id=? AND json_extract(request_json,'$.role')!='event_evidence'",(batch['id'],)).fetchone()[0]
     progress(stage=request['role'],batch_id=batch['id'],completed=completed,total=total,job_id=identifier)
     if row['output_json']:return json.loads(row['output_json'])
+    if request.get('writer_mode')=='append' and request['append_remaining_chars']<=0:
+        raise FactEventSettlementBlockedError('旧 Event 已达整篇 1500 字符上限，无法追加；请明确重建计划并选择整篇 rewrite，旧正文与原话仍保留。')
     config=snapshot(database,batch['id']);policy=config['policy']
     model=config['models'].get(request.get('execution',{}).get('task',request['role'])) if policy['execution_mode']!='agent' else None
     if model is None and request.get('transcription_only') and policy['execution_mode']!='agent':
@@ -1064,7 +1187,7 @@ async def job(database,batch,request,key,runner):
         raise ValueError('Event Writer 只接收图片转录，不接收原图')
     verify_images(request.get('images',[]))
     if not runner and not model:
-        raise AwaitAgent({'status':'awaiting_agent','job_id':identifier,'role':request['role'],'request':request,
+        raise AwaitAgent({'status':'awaiting_agent','job_id':identifier,'role':request['role'],'request':writer_task_view(request),
             'instructions':'Configure an MCP agent as described in Settings > Agent guide, read the frozen prompt, submit with pipeline_submit and call pipeline_next again.'})
     image=request['images'][0] if request.get('transcription_only') and len(request.get('images',[]))==1 else None
     if image:
@@ -1082,7 +1205,8 @@ async def job(database,batch,request,key,runner):
         prompt=api_prompt
         attempts=FAILURE_LIMIT-image_failures(database,image['sha256']) if image else max(1,3-stage_failures(database,identifier))
         for attempt in range(attempts):
-            progress(attempt=attempt+1,stage=request['role'])
+            progress(attempt=attempt+1,stage=request['role'],
+                     prompt_chars=len(prompt)+len(request['rules']))
             raw='';received=False
             try:
                 content=([{'type':'text','text':prompt}]+[{'type':'image_url','image_url':{'url':item['url']}} for item in request.get('images',[])]) if request.get('images') else prompt
@@ -1117,12 +1241,12 @@ async def job(database,batch,request,key,runner):
                 progress(error=reason,attempt=attempt+1)
                 if isinstance(error,latest.CuratorCoverageError):
                     if curator_omission_attempts(database,identifier)>=2:
-                        pause_curator_repair(database,identifier,error)
+                        return accept_curator_omission(database,identifier,error)['output']
                     prompt=curator_repair_prompt(request,output,error)
                     if len(prompt)+len(request['rules'])>policy['max_prompt_chars']:
-                        pause_curator_repair(database,identifier,error)
+                        return accept_curator_omission(database,identifier,error)['output']
                     if attempt==attempts-1:
-                        pause_curator_repair(database,identifier,error)
+                        return accept_curator_omission(database,identifier,error)['output']
                     continue
                 elif image:record_image_failure(database,image,error)
                 else:fail_stage(database,batch,identifier,error)
@@ -1140,7 +1264,7 @@ async def job(database,batch,request,key,runner):
             raise
         retry_request={**request,'prompt':curator_repair_prompt(request,output,error)}
         if len(retry_request['prompt'])+len(request['rules'])>policy['max_prompt_chars']:
-            pause_curator_repair(database,identifier,error)
+            return accept_curator_omission(database,identifier,error)['output']
         try:
             output=prepare_stage_output(request,await runner(request['role'],retry_request))
             accepted=submit(database,identifier,output)
@@ -1153,15 +1277,38 @@ async def job(database,batch,request,key,runner):
     except Exception as error:
         if not image:fail_stage(database,batch,identifier,error)
         raise
+    if accepted.get('status')=='host_deferred':
+        output=accepted['output']
     progress(completed=completed+1)
     return output
 
 
+def writer_task_view(request):
+    """Agent downloads carry the Writer input, not the host's full source union."""
+    if request['role']!='event_writer':return request
+    view={key:request[key] for key in ('role','identity','batch_id','contract','runtime_revision',
+        'execution','rules','prompt','images','image_input_mode','curator_image_transcriptions',
+        'writer_previous_body_only','writer_mode','append_remaining_chars','context_read') if key in request}
+    view['messages']=[{key:m[key] for key in ('id','role','content','created_at') if key in m}
+                      for m in request['messages']]
+    component=request['component']
+    view['component']={'track_ids':component['track_ids'],
+        'messages':[{'id':m['id']} for m in component['messages']]}
+    if component.get('context_receipt'):view['component']['context_receipt']=component['context_receipt']
+    view['event']={key:request['event'][key] for key in
+        ('event_ref','action','base_event_ids','primary_track_id','append_only') if key in request['event']}
+    return view
+
+
 def extend_context(database,component,context_request):
     # Read at most six prior routed ownership units from the declared Track.
+    scopes=list({(m['source'],m['original_session_id']) for m in component['context_messages']})
     with Store(database,read_only=True) as store:
-        rows=store.conn.execute('SELECT r.* FROM pipeline_routes p JOIN raw_events r ON r.id=p.raw_id WHERE r.id<? AND (json_extract(p.route_json,\'$.primary_track_id\')=? OR EXISTS (SELECT 1 FROM json_each(p.route_json,\'$.context_track_ids\') WHERE value=?)) ORDER BY r.id DESC',
-            (context_request['before_message_id'],context_request['track_id'],context_request['track_id'])).fetchall()
+        rows=store.conn.execute('SELECT r.* FROM pipeline_routes p JOIN raw_events r ON r.id=p.raw_id WHERE r.id<? '
+            'AND EXISTS (SELECT 1 FROM json_each(?) s WHERE r.source=json_extract(s.value,\'$[0]\') '
+            'AND r.session_id=json_extract(s.value,\'$[1]\')) '
+            'AND (json_extract(p.route_json,\'$.primary_track_id\')=? OR EXISTS (SELECT 1 FROM json_each(p.route_json,\'$.context_track_ids\') WHERE value=?)) ORDER BY r.id DESC LIMIT 6',
+            (context_request['before_message_id'],encode(scopes),context_request['track_id'],context_request['track_id'])).fetchall()
     existing={m['id']:m for m in component['context_messages']}
     projected=[task_message(r) for r in reversed(rows)]
     prior=[item for item in projected if item['session_id'] in component['context_session_ids']]
@@ -1195,11 +1342,17 @@ def settle(database,batch,data,routed,plans):
             append_only=bool(event.get('append_only'))
             if append_only:
                 if len(bases)!=1 or not str(written['event_draft']).strip():
-                    raise ValueError('Protected continuation requires one base and new prose')
+                    raise ValueError('Continuation requires one base and new prose')
                 title=bases[0]['title'];body=bases[0]['body']+'\n\n'+written['event_draft'].strip()
+                if len(body)>latest.EVENT_BODY_ACCEPT_MAX_CHARS:
+                    raise FactEventSettlementBlockedError('旧正文与新增段落总计超过 1500 字符，未保存；请压缩新增段落或明确重建为整篇 rewrite，旧正文与原话仍保留。')
                 recallable=None if bases[0]['recallable'] is None else bool(bases[0]['recallable'])
             else:
-                title=written['title'];body=written['event_draft'];recallable=written['recallable']
+                title=written['title'];body=written['event_draft']
+                # Evidence is already accepted. Preserve a predecessor's manual
+                # closure; the Writer never chooses surfacing eligibility.
+                recallable=(False if any(b.get('recallable') == 0 for b in bases) else
+                            None if any(b.get('recallable') is None for b in bases) else True)
             item={'type':'event','title':title,'body':body,'recallable':recallable,'source_refs':refs,
                 'origin_id':'assistant_bridge:'+batch['id']+':'+str(len(items))}
             if bases:
@@ -1223,8 +1376,10 @@ def settle(database,batch,data,routed,plans):
             'pending':len(data['messages'])+len(data['parked'])-len(processed),
             'skipped':sum(value=='skipped' for value in processed.values()),
             'deferred':len(deferred),
-            'protected_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips']],
+            'protected_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips'] if entry.get('reason')!='no_new_sources'],
+            'no_new_source_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips'] if entry.get('reason')=='no_new_sources'],
             'candidate_overflow_deferrals':[entry for _,plan,_ in plans for entry in plan.get('host_deferrals',[])],
+            'curator_omission_deferrals':[entry for _,plan,_ in plans for entry in plan.get('curator_omission_deferrals',[])],
             'image_deferrals':[entry for _,plan,_ in plans for entry in plan.get('image_deferrals',[])],
             'missing_images':[entry for component,_,_ in plans for entry in component.get('missing_images',[])],
             'task_snapshot_compacted':True}
@@ -1287,6 +1442,7 @@ async def transcribe_component(database,batch,component,index,runner,*,key_prefi
     cached=reusable_transcriptions(database,component['context_messages'],images)
     if len(cached)==len(images):
         component['curator_image_transcriptions']=cached
+        persist_transcriptions(database,cached)
         return bool(images)
     if not images:return False
     message_ids=[item['source_message_id'] for item in images]
@@ -1353,10 +1509,17 @@ async def first_event_writer_pass(database,batch,component,plan,index,runner):
     by_id={m['id']:m for m in component['context_messages']}
     async def invoke_one(ordinal,event):
         stable={message['id'] for message in component['messages']}
-        owned=[by_id[key] for key in event['source_message_ids'] if not event.get('append_only') or key in stable]
+        inherited={key for base in component['base_event_candidates']
+                   for key in base['source_message_ids']}
+        if event['base_event_ids'] and not (set(event['source_message_ids']) & (stable-inherited)):
+            return event,{'evidence_sufficient':False},{'curator_image_transcriptions':[]},[]
+        owned=[by_id[key] for key in event['source_message_ids']
+               if not event.get('append_only') or key in stable - inherited]
         request=request_for(database,batch,'event_writer',messages=owned,event=event,component=component)
         written=await job(database,batch,request,f'event_writer:{index}:{ordinal}',runner)
-        return event,written,request,owned
+        # Accepted pre-change outputs keep their original full-body semantics;
+        # unfinished tasks are regenerated by job() under the new policy.
+        return request['event'],written,request,request['messages']
 
     concurrency=event_writer_concurrency(database,batch,runner)
     if concurrency<=1 or len(plan['events'])<=1:
@@ -1416,12 +1579,20 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
             with Store(database) as store:store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encoded_data,batch['id']))
             output=await job(database,batch,request,f'event_curator:{index}',runner)
             component=request['component']
+            if '_host_curator_omission' in output:
+                pause_repeated_curator_omission(database,batch,component,output)
+                plans.append((component,curator_omission_plan(component,output),[]))
+                continue
             if output.get('context_request') is not None:
                 component=extend_context(database,component,output['context_request'])
                 pretranscribed=await transcribe_component(database,batch,component,f'{index}:context',runner)
                 request=request_for(database,batch,'event_curator',component=component,context_read=True,pretranscribed=pretranscribed)
                 output=await job(database,batch,request,f'event_curator:{index}:context',runner)
                 component=request['component']
+                if '_host_curator_omission' in output:
+                    pause_repeated_curator_omission(database,batch,component,output)
+                    plans.append((component,curator_omission_plan(component,output),[]))
+                    continue
             # job() restores its frozen request on resume; use that contract,
             # not the cache state computed before loading the saved task.
             if not request.get('pretranscribed'):
@@ -1469,12 +1640,13 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                 accepted={e['event_ref'] for e in plan['events']}
                 event_results=[(event,written) for event,written in event_results if event['event_ref'] in accepted]
             plans.append((component,plan,event_results))
-        return settle(database,batch,data,routed,plans)
+        return settle(database,batch,data,routed,propagate_curator_omission(plans))
     except PausedBatch:
         with Store(database,read_only=True) as store:
             return json.loads(store.conn.execute('SELECT result_json FROM pipeline_batches WHERE id=?',(batch['id'],)).fetchone()[0])
     except AwaitAgent as wait:return wait.task
     except RoutingRecoveryError as error:return mark_needs_repair(database,batch,error)
+    except FactEventSettlementBlockedError as error:return mark_needs_repair(database,batch,error,settlement=True)
 
 
 def tools_for(settings):

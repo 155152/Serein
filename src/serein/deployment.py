@@ -14,7 +14,7 @@ DEFAULT_UPSTREAM = {'base_url': '', 'model': '', 'writer_model': '', 'api_key': 
                     'writer_enabled': False, 'memory_enabled': False, 'operit_enabled': True}
 DEFAULT_FEATURES = {'memos':False, 'persona':False, 'anti_retreat':False, 'window_shadows':False, 'association':False, 'write_context':False, 'relations_auto_accept':False, 'resume':False, 'originals':False, 'favorites':False, 'narrative_tools':False, 'narrative_nightly_organize':False, 'event_to_scene':False, 'current_time':False, 'image_transcription_async':False, 'image_eyes':False}
 DEFAULT_CLOCK = {'timezone':'Asia/Shanghai'}
-DEFAULT_RESUME = {'latest_shadow':True, 'recent_events':True, 'favorite_scenes':True, 'selected_memories':False, 'selected_ids':[],
+DEFAULT_RESUME = {'mode':'command', 'latest_shadow':True, 'recent_events':True, 'favorite_scenes':True, 'selected_memories':False, 'selected_ids':[],
                   'recent_originals':False, 'recent_original_limit':20, 'pending_originals':True}
 DEFAULT_DOMAINS = [
     {'key':'relationship','label':'关系','description':'身份、称呼、承诺、边界与沟通方式','policy':'normal'},
@@ -51,7 +51,7 @@ def read_from_store(store):
             'tagging': saved.get('tagging', {'domains': DEFAULT_DOMAINS}),
             'tagging_version': saved.get('tagging_version', 1),
             'dream': {'main_prompt':'', 'daily_probability':0.4, **saved.get('dream', {})},
-            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':12000,'max_prompt_chars':40000,'timeout_seconds':600,'event_writer_concurrency':1,'track_lookback_days':3,
+            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':40000,'max_prompt_chars':200000,'timeout_seconds':600,'event_writer_concurrency':1,'track_lookback_days':3,
                          'joint_review_enabled':False,'material_review_enabled':False,'round_gate_enabled':False,
                          'append_protected_enabled':False,
                          **saved.get('pipeline',{})},
@@ -65,7 +65,7 @@ def feature_enabled(database, name):
 def grouped_upstreams(state):
     """Present legacy connections in the same editor without losing credentials."""
     groups = deepcopy(state['upstreams'])
-    route_keys = ('id','label','dimension','query_instruction','document_instruction')
+    route_keys = ('id','label','dimension','query_instruction','document_instruction','tokenizer')
     for model in state['models']:
         connection = {key:value for key,value in model.items() if key not in (*route_keys,'model')}
         group = next((item for item in groups if all(item.get(key, '') == connection.get(key, '')
@@ -130,6 +130,8 @@ def read_settings(database, *, public=False):
 def save_settings(database, changes):
     changes=deepcopy(changes)
     resume_changes=changes.get('resume') or {}
+    if 'mode' in resume_changes and resume_changes['mode'] not in ('command','mcp'):
+        raise ValueError('Resume mode must be command or mcp')
     if resume_changes.get('recent_originals') is True:
         resume_changes['pending_originals']=False
     elif resume_changes.get('pending_originals') is True:
@@ -141,12 +143,28 @@ def save_settings(database, changes):
         explicit_mode='execution_mode' in (json.loads(stored[0]).get('pipeline',{}) if stored else {}) or 'execution_mode' in changes.get('pipeline',{})
         if changes.get('expected_version') is not None and changes['expected_version'] != current['settings_version']:
             raise Conflict('设置已在其他页面更新，请刷新后重试')
+        if changes.get('expected_tagging_version') is not None and changes['expected_tagging_version'] != current['tagging_version']:
+            raise Conflict('domain_policy_publish_version_conflict')
         for section, values in changes.items():
-            if section == 'expected_version':continue
+            if section in ('expected_version', 'expected_tagging_version'):continue
             if section == 'tagging':
-                if current['tagging'] != values:
+                tagging = deepcopy(current['tagging'])
+                if 'domains' in values:
+                    tagging['domains'] = values['domains']
+                if 'policies' in values:
+                    tagging['policies'] = {**tagging.get('policies', {}), **values['policies']}
+                keys = {item['key'] for item in tagging['domains']}
+                for kind, rules in (values.get('policies') or {}).items():
+                    if kind not in ('event', 'scene') or not isinstance(rules, dict) or rules.keys() - keys:
+                        raise ValueError('Invalid domain policy catalog')
+                    if any(rule not in ('normal', 'explicit_only', 'excluded') for rule in rules.values()):
+                        raise ValueError('Invalid domain policy')
+                if 'policies' in tagging:
+                    tagging['policies'] = {kind:{key:rule for key,rule in rules.items() if key in keys}
+                                           for kind,rules in tagging['policies'].items()}
+                if current['tagging'] != tagging:
                     current['tagging_version'] += 1
-                current['tagging'] = values
+                current['tagging'] = tagging
             elif section == 'models':
                 previous = {item['id']: item for item in current['models']}
                 current['models'] = [{**previous.get(item['id'], {}), **item} for item in values]
