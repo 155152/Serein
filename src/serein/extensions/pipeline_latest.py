@@ -208,7 +208,7 @@ def build_event_track_curator_prompt(date_view: str, component: dict[str, Any], 
             f'{json.dumps(format_hint, ensure_ascii=False)}\n\n'
             '只选择 scope=stable 的完整 unit。每个 stable unit 必须恰好进入 Event、skip 或 defer；只有 Router 声明的 bridge 可共享。'
             'parked/context_only 只可阅读。extend/rewrite/merge 只填写 base_event_ids，host 保留原文并集。'
-            '普通接续用 extend，Writer 仅写新增段落；只有必须整篇重新组织时才显式用 rewrite（一条 base），合并多条 base 用 merge。'
+            '普通接续用 extend，Writer 仅写新增段落；但旧 Event 正文已达 1500 字符或剩余空间不足以容纳新的实质段落时，必须选择 rewrite（一条 base），整篇重新组织新旧证据，不能继续 extend。只有必须整篇重新组织时也应显式用 rewrite（一条 base），合并多条 base 用 merge。'
             'parked 直接纠正紧邻 stable 结果时 defer；无关 parked 不影响已落定材料。'
             'rolling_engineering 逐条核对实际建设，相关 base 全选；受保护前版仍拟议 extend/merge，由 host 按冻结配置检查能否原文后追加，否则暂缓。\n'
             '整个 corridor 缺少对象、起因或被纠正旧主张时可一次返回 context_request；它与 Event 决定严格二选一，'

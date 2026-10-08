@@ -147,6 +147,8 @@ def test_prompts_explain_opt_in_bridge_evidence_and_default_exclusive_evidence()
     component, _ = case()
     enabled = latest.build_event_track_curator_prompt('2025-01-01', component)
     assert '不要删改完整 bridge ownership' in enabled and '引文不得跨越省略片段拼接' in enabled
+    assert '旧 Event 正文已达 1500 字符' in enabled
+    assert '必须选择 rewrite' in enabled
     component['writer_material_review'] = False
     disabled = latest.build_event_track_curator_prompt('2025-01-01', component)
     assert '边界证据须从左右各自独占的 owned 原文逐字引用' in disabled
