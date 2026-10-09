@@ -19,8 +19,7 @@ def test_event_scene_switch_persists_and_refreshes_http_mcp(tmp_path, writable):
     services = Application(settings).services
     event = services.write('seed', 'save', {'kind':'event', 'title':'Trip', 'body_md':'A trip',
         'sources':[{'source_key':'synthetic:trip', 'content':'Keep the ticket.'}]})
-    request = {'operation_id':'promote', 'event_id':event['id'], 'expected_revision':1,
-               'title':'The ticket', 'body_md':'I kept our ticket.'}
+    request = {'candidate_id':event['id'],'title':'The ticket','body':'I kept our ticket.','cues':'ticket'}
     from dataclasses import replace
     settings = replace(settings, writable=writable)
     headers = {'Authorization':'Bearer test', 'Accept':'application/json, text/event-stream'}
@@ -51,6 +50,7 @@ def test_event_scene_switch_persists_and_refreshes_http_mcp(tmp_path, writable):
             return
         from serein.deployment import read_settings
         assert read_settings(settings.database)['features']['event_to_scene'] is True
+        services.write('choose','mailbox_select',{'event_id':event['id'],'expected_revision':1,'expected_queue_revision':0})
         promoted = call()
         assert not promoted.get('isError')
         scene_id = promoted['structuredContent']['id']
@@ -61,7 +61,7 @@ def test_event_scene_switch_persists_and_refreshes_http_mcp(tmp_path, writable):
         assert call()['isError']
         assert client.post('/v1/extensions/promote_event_to_scene', json=request).status_code == 404
         assert 'promote_event_to_scene' not in names()
-        assert services.read(scene_id)['document']['body_md'] == request['body_md']
+        assert services.read(scene_id)['document']['body_md'] == request['body']
         assert services.read(event['id'])['document']['body_md'] == 'A trip'
 
 
@@ -210,6 +210,68 @@ def test_official_streamable_http_client(tmp_path, entry_path):
     asyncio.run(exercise())
 
 
+def test_optional_candidate_and_agent_tools_refresh_and_reject_cached_calls(tmp_path,monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+    from serein.application import Application
+    from serein.api.mcp import create_server
+    from serein.deployment import read_settings
+    settings=Settings(tmp_path/'optional-tools.db',writable=True)
+    with Store(settings.database):pass
+    app=Application(settings)
+    server=create_server(app)
+    candidates={'propose_memory','list_candidates','review_memory'}
+    agents={'pipeline_next','pipeline_submit','pipeline_rebuild'}
+    advance=AsyncMock(return_value={'status':'synthetic'})
+    submit=Mock(return_value={'status':'synthetic'})
+    monkeypatch.setattr('serein.extensions.pipeline.advance',advance)
+    monkeypatch.setattr('serein.extensions.pipeline.submit',submit)
+    draft={'kind':'scene','title':'Synthetic','body_md':'Synthetic candidate','cues':['synthetic'],'date':'2030-01-01'}
+    proposal=app.services.write('synthetic-proposal','propose',draft,scene_only=True)
+    before=app.services.candidates()
+    async def exercise():
+        assert not (candidates|agents)&{t.name for t in await server.list_tools()}
+        for name in candidates|agents:
+            with pytest.raises(Exception,match='Unknown tool'):await server.call_tool(name,{})
+        save_settings(settings.database,{'features':{'memory_candidates':True}})
+        names={t.name for t in await server.list_tools()}
+        assert candidates<=names and not agents&names
+        result=await server.call_tool('list_candidates',{})
+        assert result[1]['items']==before['items']
+        save_settings(settings.database,{'features':{'pipeline_agent':True}})
+        assert candidates|agents <= {t.name for t in await server.list_tools()}
+        await server.call_tool('pipeline_next',{})
+        await server.call_tool('pipeline_submit',{'job_id':'synthetic','output':{}})
+        assert advance.await_count==1 and submit.call_count==1
+        save_settings(settings.database,{'features':{'memory_candidates':False,'pipeline_agent':False}})
+        for name in candidates|agents:
+            with pytest.raises(Exception,match='Unknown tool'):await server.call_tool(name,{})
+        assert not (candidates|agents)&{t.name for t in await server.list_tools()}
+    asyncio.run(exercise())
+    assert app.services.candidates()==before
+    assert read_settings(settings.database)['pipeline']['auto_enabled'] is True
+    with TestClient(create_app(settings,token='test',live=True),headers={'Authorization':'Bearer test'}) as client:
+        assert client.post('/v1/extensions/pipeline_next',json={}).status_code==404
+        client.patch('/v1/settings',json={'features':{'pipeline_agent':True}}).raise_for_status()
+        assert client.post('/v1/extensions/pipeline_next',json={}).json()=={'status':'synthetic'}
+        client.patch('/v1/settings',json={'features':{'pipeline_agent':False}}).raise_for_status()
+        assert client.post('/v1/extensions/pipeline_submit',json={'job_id':'synthetic','output':{}}).status_code==404
+
+
+def test_optional_candidate_and_agent_whitelists_and_read_only(tmp_path):
+    import asyncio
+    from serein.application import Application
+    from serein.api.mcp import create_server
+    database=tmp_path/'whitelist-tools.db'
+    with Store(database):pass
+    save_settings(database,{'features':{'memory_candidates':True,'pipeline_agent':True}})
+    names={'propose_memory','list_candidates','review_memory','pipeline_next','pipeline_submit','pipeline_rebuild'}
+    server=create_server(Application(Settings(database,writable=True,mcp_tools=['list_candidates','pipeline_next'])))
+    assert {t.name for t in asyncio.run(server.list_tools())}=={'list_candidates','pipeline_next'}
+    read_only=create_server(Application(Settings(database,writable=False)))
+    assert not names & {t.name for t in asyncio.run(read_only.list_tools())}
+
+
 def test_window_shadow_returns_each_section_once_over_http_and_mcp(tmp_path):
     import asyncio
     import json
@@ -235,18 +297,21 @@ def test_window_shadow_returns_each_section_once_over_http_and_mcp(tmp_path):
     assert shadows.read('missing')['status'] == 'not_found'
     with TestClient(create_app(settings, token='shadow-test', live=True),
                     headers={'Authorization':'Bearer shadow-test'}) as client:
-        assert client.post('/v1/extensions/window_shadow_read', json={}).json() == expected
+        text = client.post('/v1/extensions/window_shadow_read', json={}).json()
+        assert 'index: 1' in text and 'test-window' not in text
+        assert all(text.count(value)==1 for value in sections.values())
         def rpc(method, params=None):
             return client.post('/mcp', headers={'Accept':'application/json, text/event-stream'}, json={
                 'jsonrpc':'2.0', 'id':1, 'method':method, 'params':params or {}}).json()['result']
         names = {t['name'] for t in rpc('tools/list')['tools']}
-        assert 'window_shadow_write' in names and 'window_shadow_read' not in names
-        assert rpc('tools/call', {'name':'window_shadow_read', 'arguments':{}})['isError']
+        assert {'window_shadow_write','window_shadow_read'} <= names
+        result = rpc('tools/call', {'name':'window_shadow_read', 'arguments':{}})
+        assert not result.get('isError') and result['content'][0]['text']==text
     with Store(settings.database, read_only=True) as store:
         assert tuple(store.conn.execute('select * from historical_works').fetchone()) == original
 
 
-def test_shadow_writer_survives_retired_reader_and_feature_refresh(tmp_path):
+def test_shadow_reader_and_writer_follow_feature_refresh(tmp_path):
     import asyncio
     from serein.api.mcp import create_server
     from serein.application import Application
@@ -259,11 +324,11 @@ def test_shadow_writer_survives_retired_reader_and_feature_refresh(tmp_path):
     server = create_server(Application(settings))
 
     async def exercise():
-        assert {t.name for t in await server.list_tools()} == {'window_shadow_write'}
+        assert {t.name for t in await server.list_tools()} == {'window_shadow_write','window_shadow_read'}
         await server.call_tool('window_shadow_write', {'window_id':'synthetic', 'title':'Test', 'content':'Full authored shadow'})
         assert WindowShadows(settings.database).read('synthetic')['content'] == 'Full authored shadow'
         save_settings(settings.database, {'features':{'window_shadows':False}})
         assert not await server.list_tools()
         save_settings(settings.database, {'features':{'window_shadows':True}})
-        assert {t.name for t in await server.list_tools()} == {'window_shadow_write'}
+        assert {t.name for t in await server.list_tools()} == {'window_shadow_write','window_shadow_read'}
     asyncio.run(exercise())

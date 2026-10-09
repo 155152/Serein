@@ -195,11 +195,11 @@ def routes(settings, services, auth):
                         'clock':state['clock']}
         cache_window = window_id + ':' + digest(encode(cache_contract)) if window_id else uuid4().hex
         resume_query = chat_resume.continuation(query)
-        command_resume = state['features']['resume'] and state['resume']['mode']=='command'
+        command_resume = state['features']['resume'] and state['resume']['command_enabled']
         if resume_query is not None and not state['features']['resume']:
             raise HTTPException(409, 'Enable resume in Settings before using /resume')
         if resume_query is not None and not command_resume:
-            raise HTTPException(409, 'MCP resume is active; use the resume tool or select command mode in Settings')
+            raise HTTPException(409, 'Enable the /resume command in Settings before using it')
         snapshot_key, snapshot = context._find_turn_injection_snapshot(cache_window, incoming, body)
         replay = snapshot is not None and (not query or len(incoming)==snapshot['source_message_count'])
         selected = []
@@ -259,7 +259,7 @@ def routes(settings, services, auth):
                 summary = recall_summary(result)
                 recall_state = 'selected' if selected else 'skipped' if result.get('status') == 'skipped' or (result.get('routing') or {}).get('action') == 'skip' else 'no_match'
             feature_context = ''
-            if query and any(state['features'][key] for key in ('memos','persona','anti_retreat')):
+            if query and any(state['features'][key] for key in ('memos','persona','anti_retreat','dream_morning')):
                 from ..chat_features import prepare
                 feature_context,feature_receipt = await prepare(settings.database,window_id,query,incoming)
             clock_context = current_time_context(state['clock']['timezone']) if query and state['features']['current_time'] else ''

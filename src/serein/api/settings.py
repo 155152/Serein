@@ -159,7 +159,10 @@ class TaggingPatch(BaseModel):
 
 class ResumePatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    mode: Literal['command','mcp'] | None = None
+    mode: Literal['command','mcp'] | None = None  # Legacy exclusive selector.
+    command_enabled: bool | None = Field(default=None, strict=True)
+    mcp_enabled: bool | None = Field(default=None, strict=True)
+
     latest_shadow: bool | None = None
     recent_events: bool | None = None
     favorite_scenes: bool | None = None
@@ -168,6 +171,13 @@ class ResumePatch(BaseModel):
     recent_original_limit: int | None = Field(default=None, ge=1, le=50, strict=True)
     pending_originals: bool | None = None
     selected_ids: list[str] | None = Field(default=None, max_length=200)
+
+    @field_validator('command_enabled', 'mcp_enabled', mode='before')
+    @classmethod
+    def entry_switch(cls, value):
+        if type(value) is not bool:
+            raise ValueError('Resume entry switches must be booleans')
+        return value
 
     @field_validator('selected_ids')
     @classmethod
@@ -205,6 +215,9 @@ class PipelinePatch(BaseModel):
     timeout_seconds: int | None = Field(default=None,ge=30,le=1800)
     event_writer_concurrency: int | None = Field(default=None,ge=1,le=8,strict=True)
     track_lookback_days: int | None = Field(default=None,ge=1,le=365,strict=True)
+    track_candidates_enabled: bool | None = Field(default=None,strict=True)
+    track_direct_hours: Literal[12,24,48,72] | None = None
+    track_candidate_limit: int | None = Field(default=None,ge=1,le=50,strict=True)
     joint_review_enabled: bool | None = None
     material_review_enabled: bool | None = None
     round_gate_enabled: bool | None = None
@@ -216,11 +229,12 @@ class RecallPatch(BaseModel):
     direct_threshold: float | None = Field(default=None, ge=0, le=1, strict=True)
     body_candidate_threshold: float | None = Field(default=None, ge=0, le=1, strict=True)
     cue_candidate_threshold: float | None = Field(default=None, ge=0, le=1, strict=True)
+    direct_pool_limit: int | None = Field(default=None, ge=6, le=100, strict=True)
     passages_enabled: bool | None = Field(default=None, strict=True)
     passage_min_chars: int | None = Field(default=None, ge=1, le=100000, strict=True)
 
     @field_validator('direct_threshold', 'body_candidate_threshold', 'cue_candidate_threshold',
-                     'passages_enabled', 'passage_min_chars', mode='before')
+                     'direct_pool_limit', 'passages_enabled', 'passage_min_chars', mode='before')
     @classmethod
     def reject_null(cls, value):
         if value is None: raise ValueError('Recall settings cannot be null')
@@ -375,6 +389,7 @@ def _link_candidates(conn, kind, query='', date_filter='', offset=0, limit=30, i
 def routes(settings, auth):
     router = APIRouter(dependencies=auth)
     from ..configured_models import memory_ready, memory_status, prepare_selected
+    from ..recall.index_safety import index_status, resume_index, IndexBlocked
 
     @router.get('/v1/settings/resume-candidates')
     def resume_candidates(response: Response, kind: Literal['event','scene','diary','darkroom','upload',''] = 'event', q: str = Query('',max_length=200),
@@ -412,8 +427,9 @@ def routes(settings, auth):
         policy=RecallPolicy.from_config(recall_settings(settings))
         return {**read_settings(settings.database, public=True), 'recall':{key:getattr(policy,key) for key in
                 ('direct_threshold','body_candidate_threshold','cue_candidate_threshold',
-                 'passages_enabled','passage_min_chars')},
-                'memory_ready': status['ready'], 'memory_status':status}
+                 'direct_pool_limit','passages_enabled','passage_min_chars')},
+                'memory_ready': status['ready'], 'memory_status':status,
+                'index_status':index_status(settings.database)}
 
     @router.patch('/v1/settings')
     def save(body: SettingsPatch, response: Response):
@@ -435,6 +451,22 @@ def routes(settings, auth):
             return await discover(settings, request)
         except ValueError as error:
             raise HTTPException(400, str(error)) from None
+
+    @router.get('/v1/settings/index-status')
+    def read_index_status(response: Response):
+        response.headers['Cache-Control'] = 'no-store'
+        return index_status(settings.database)
+
+    @router.post('/v1/settings/resume-index')
+    def recover_index(body: dict):
+        if not settings.writable:
+            raise HTTPException(403, 'This deployment is read-only')
+        if body.get('confirm') != 'RESUME_INDEX_EMBEDDING':
+            raise HTTPException(400, 'Explicit index recovery confirmation required')
+        try:
+            return resume_index(settings.database, body.get('recovery_token'))
+        except IndexBlocked as error:
+            raise HTTPException(409, str(error)) from None
 
     @router.post('/v1/settings/prepare-memory')
     def prepare_memory():

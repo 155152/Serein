@@ -6,30 +6,34 @@ const features = {
   image_eyes:['眼睛（主模型不能识图时）','先由图片转录模型看图，把转录注入当前聊天，再移除发往主模型的原图；原始消息仍保存原图和转录。与“异步图片转录”只能开启一个。'],
   current_time:['当前日期时间','每个新用户轮次向聊天主模型注入所选时区的日期和时间；工具续轮沿用该轮时间。只保证当轮请求能看到时间，Serein 无法修改客户端已落盘的消息记录。'],
   memos:['备忘','留给未来的话。到期时带入聊天；关闭后不注册备忘工具。'],
+  dream_read:['梦境读取','让模型按倒数第几篇阅读梦境，1 是最新一篇，多个数字用逗号分隔。阅读不消耗晨间注入；关闭后不注册此工具。'],
+  dream_morning:['晨间梦境注入','每天所选时区凌晨四点后，随第一条新消息带入最近 24 小时内最新未带入的梦。成功回复后记为已带入，每天最多一次；没有梦时不调用模型。'],
   persona:['心绪','记录并延续对话状态。请在“配置”页选择“心绪/防撤退”使用的模型。'],
   anti_retreat:['防撤退','使用“心绪/防撤退”模型，回复后异步判断、下一轮提示。同一窗口冷却 6 轮且至少 10 分钟。'],
-  window_shadows:['窗影','由 agent 主动写下窗口侧影。关闭后不注册窗影工具。'],
+  window_shadows:['窗影','由 agent 主动写下窗口侧影，也可按倒数第几篇读取；1 是最新一篇，多个数字用逗号分隔。关闭后不注册窗影工具。'],
   originals:['原话查阅','按文字、日期、角色找原话，默认最多返回 10 条；按 ID 读全文和同会话前后文。关闭后不注册这两个工具。'],
-  event_to_scene:['Event 升为 Scene','让主模型读过 Event 和原话后，自己编辑并保存为 Scene。默认关闭；关闭后不再提供工具，已有记忆保留。'],
+  event_to_scene:['Event 升为 Scene','把明确选中的 Event 放入信箱，读过原话后编辑正文与召回入口，再手动升为 Scene；也可由主模型处理选中的草稿。默认关闭，已有记忆和草稿保留。'],
+  memory_candidates:['记忆候选工具','允许模型提出、查看和审核 Scene 候选。关闭后隐藏 propose_memory、list_candidates、review_memory，已有候选保留。'],
+  pipeline_agent:['自动摘要 Agent 工具','允许外部 Agent 用 pipeline_next、pipeline_submit 领取任务并提交结果，同时提供 pipeline_rebuild 修复工具。与自动摘要开关独立；使用 Agent 前请在“配置”页阅读接入指南。'],
   favorites:['收藏工具','让模型读取、收藏或取消收藏 Event 和 Scene。读取默认每页 10 条；写入和状态工具可传 favorite。关闭不影响页面收藏。'],
   narrative_tools:['主模型读写叙事卷','注册叙事卷读写工具，让聊天主模型自己阅读、起草和保存。同时关闭自动 Narrative Writer；关闭此开关不会自动重启 Writer。'],
   narrative_nightly_organize:['夜间整理叙事卷','每天凌晨四点后，用“叙事卷找材料”模型把新增 Event、Scene 和可读日记接入旧 Arc，或建立空白 collecting Arc。没有新增材料不调用模型，也不会自动写正文。'],
   association:['联想','沿已确认的 Scene 关系，最多补一条记忆参与召回筛选。关闭后仅直接召回，已有关系保留。'],
   write_context:['写入时找前情','新建 Scene 后，至多提示一条可能相关的旧 Scene，以及它可能所属的 Arc。只返回候选，不建关系或加入 Arc；没有可靠线索就不提示。'],
   relations_auto_accept:['关系提案自动通过','新提案写完后自动通过；仍需通过当前记忆与证据校验。'],
-  resume:['开窗续接（resume）','按保存的选择读取续接资料。发送 /resume 和通过 MCP 读取只能选择一个。'],
+  resume:['开窗续接（resume）','按保存的选择读取续接资料。网关 /resume 指令与 MCP 工具可分别开启，也可同时开启。关闭此总开关会停用两个入口，保留内容选择。'],
 };
 
 const fallbackTimeZones = ['Asia/Shanghai','UTC','Asia/Tokyo','Asia/Singapore','Europe/London','Europe/Berlin','America/New_York','America/Chicago','America/Denver','America/Los_Angeles','Australia/Sydney'];
 const timeZones = [...new Set([...fallbackTimeZones,...(Intl.supportedValuesOf?.('timeZone')||[])])];
 
 export function FeatureSettings({onOpenSummary,onOpenEventGuide}) {
-  const [values,setValues]=useState(null),[resumeMode,setResumeMode]=useState('command'),[settingsVersion,setSettingsVersion]=useState(null),[clock,setClock]=useState({timezone:'Asia/Shanghai'}),[status,setStatus]=useState(''),[busy,setBusy]=useState(false),[autoEnabled,setAutoEnabled]=useState(false);
-  useEffect(()=>{let active=true;instanceSettings().then(value=>{if(active){setValues(value.features);setResumeMode(value.resume.mode);setSettingsVersion(value.settings_version);setClock(value.clock);setAutoEnabled(value.pipeline.auto_enabled!==false);}})
+  const [values,setValues]=useState(null),[resumeEntries,setResumeEntries]=useState({command_enabled:true,mcp_enabled:false}),[settingsVersion,setSettingsVersion]=useState(null),[clock,setClock]=useState({timezone:'Asia/Shanghai'}),[status,setStatus]=useState(''),[busy,setBusy]=useState(false),[autoEnabled,setAutoEnabled]=useState(false);
+  useEffect(()=>{let active=true;instanceSettings().then(value=>{if(active){setValues(value.features);setResumeEntries({command_enabled:value.resume.command_enabled,mcp_enabled:value.resume.mcp_enabled});setSettingsVersion(value.settings_version);setClock(value.clock);setAutoEnabled(value.pipeline.auto_enabled!==false);}})
     .catch(error=>{if(active)setStatus(error.message);});return()=>{active=false;};},[]);
   async function save(event) {
     event.preventDefault();setBusy(true);
-    try {const result=await instanceSettings({expected_version:settingsVersion,features:values,resume:{mode:resumeMode},clock,pipeline:{auto_enabled:autoEnabled}});setValues(result.features);setResumeMode(result.resume.mode);setSettingsVersion(result.settings_version);setClock(result.clock);setStatus('已保存并生效。已有内容会保留。');}
+    try {const result=await instanceSettings({expected_version:settingsVersion,features:values,resume:resumeEntries,clock,pipeline:{auto_enabled:autoEnabled}});setValues(result.features);setResumeEntries({command_enabled:result.resume.command_enabled,mcp_enabled:result.resume.mcp_enabled});setSettingsVersion(result.settings_version);setClock(result.clock);setStatus('已保存并生效。已有内容会保留。');}
     catch(error){setStatus(error.message);}finally{setBusy(false);}
   }
   return <section className="settings-group"><div className="settings-group__heading"><h3>可选功能</h3><p>按需开启，保存后生效。</p></div>
@@ -42,12 +46,15 @@ export function FeatureSettings({onOpenSummary,onOpenEventGuide}) {
       <span><strong>{label}</strong><small>{help}</small></span><input type="checkbox" role="switch" aria-label={label} disabled={busy} checked={!!values[key]}
         onChange={event=>setValues(current=>({...current,[key]:event.target.checked,
           ...(event.target.checked&&key==='image_transcription_async'?{image_eyes:false}:event.target.checked&&key==='image_eyes'?{image_transcription_async:false}:{})}))}/></label>)}
-      {values.current_time&&<label className="settings-field time-context-zone"><span>时间戳时区</span><select disabled={busy} value={clock.timezone}
+      {(values.current_time||values.dream_morning)&&<label className="settings-field time-context-zone"><span>时间戳时区</span><select disabled={busy} value={clock.timezone}
         onChange={event=>setClock({timezone:event.target.value})}>{timeZones.map(zone=><option value={zone} key={zone}>{zone}</option>)}</select>
         <small>默认 Asia/Shanghai（东八区）；注入内容也会写明当时的 UTC 偏移。</small></label>}
-      {values.resume&&<label className="settings-field"><span>续接方式</span><select aria-label="续接方式" disabled={busy} value={resumeMode} onChange={event=>setResumeMode(event.target.value)}>
-        <option value="command">发送 /resume 指令</option><option value="mcp">通过 MCP 读取续接资料</option></select>
-        <small>两种方式只能选择一个。MCP 模式停用聊天中的 /resume 指令。内容选择、预览与复制在侧栏“换窗”页。</small></label>}
+      {values.resume&&<div>
+        {Object.entries({command_enabled:['网关 /resume 指令','聊天经过本实例网关时，发送 /resume 读取资料；关闭后也停止携带此前的续接快照。'],mcp_enabled:['MCP resume 工具','向客户端提供只读 resume 工具；可与网关指令同时开启。已通过指令读取本轮资料时，无须再次调用工具。']}).map(([key,[label,help]])=><label className="settings-toggle" key={key}>
+          <span><strong>{label}</strong><small>{help}</small></span><input type="checkbox" role="switch" aria-label={label} disabled={busy} checked={!!resumeEntries[key]}
+            onChange={event=>setResumeEntries(current=>({...current,[key]:event.target.checked}))}/></label>)}
+        <p>两个入口均关闭时，仍可在侧栏“换窗”页选择、预览与复制资料。</p>
+      </div>}
       <div className="settings-actions"><button disabled={busy} type="submit">保存功能设置</button></div></form>}
     <p role="status">{status}</p></section>;
 }
